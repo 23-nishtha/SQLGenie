@@ -1,1 +1,11 @@
 pandas>=2.0
+
+# Day 2: Text-to-SQL API
+fastapi>=0.110
+uvicorn[standard]>=0.29
+openai>=1.30
+python-dotenv>=1.0
+sqlparse>=0.5
+
+# Testing
+pytest>=8.0
