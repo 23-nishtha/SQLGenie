@@ -28,6 +28,24 @@ def _get_int(name: str, default: int) -> int:
         return default
 
 
+# Local dev servers for the future frontend (Vite's default port is 5173).
+# Deliberately NOT "*": a wildcard would let ANY website's JavaScript call
+# this API from a visitor's browser. When the real frontend is deployed, set
+# CORS_ALLOWED_ORIGINS in .env to its exact origin(s) instead.
+DEFAULT_CORS_ORIGINS = "http://localhost:5173,http://127.0.0.1:5173"
+
+
+def _get_list(name: str, default: str) -> list[str]:
+    """Read a comma-separated env var as a list. Unset or blank falls back
+    to `default`. Whitespace and trailing slashes are stripped, since an
+    origin is scheme + host + port with no path ("http://x:5173/" would
+    never match what the browser sends)."""
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        raw = default
+    return [item.strip().rstrip("/") for item in raw.split(",") if item.strip()]
+
+
 class Settings:
     # --- LLM mode ---
     # "mock"   -> backend/mock_llm.py answers a small set of known questions
@@ -45,6 +63,17 @@ class Settings:
     # fail with a "model not found" error, change OPENAI_MODEL in your .env
     # to a model your account has access to (e.g. "gpt-4o-mini").
     OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-5.6-luna")
+
+    # --- Dataset (Day 6) ---
+    # Which entry of backend/dataset.py's registry describes the database
+    # being queried. Only "olist" exists today.
+    SQLGENIE_DATASET: str = os.getenv("SQLGENIE_DATASET", "olist").strip().lower()
+
+    # --- CORS (Day 6) ---
+    # Origins whose browser JavaScript is allowed to call this API — needed
+    # because the frontend runs on a different origin (port/domain) than
+    # this backend. See backend/main.py, where this feeds CORSMiddleware.
+    CORS_ALLOWED_ORIGINS: list[str] = _get_list("CORS_ALLOWED_ORIGINS", DEFAULT_CORS_ORIGINS)
 
     # --- Database ---
     DATABASE_PATH: Path = PROJECT_ROOT / os.getenv("DATABASE_PATH", "database/olist.db")

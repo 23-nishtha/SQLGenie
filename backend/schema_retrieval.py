@@ -38,7 +38,7 @@ embeddings-based approach, and they need zero extra infrastructure.
 import re
 from dataclasses import dataclass, field
 
-from backend.schema_context import get_table_columns
+from backend.schema_context import build_schema_text, get_table_columns
 
 # ---------------------------------------------------------------------------
 # Schema documents: one entry per table/view, with the business knowledge
@@ -254,9 +254,27 @@ def _load_documents(db_path=None) -> dict[str, SchemaDocument]:
 def init_documents(db_path=None) -> None:
     """Warm the document cache once at startup (see backend/main.py), so
     each request only pays for scoring (pure Python), not a fresh DB read."""
-    global _documents_cache
+    global _documents_cache, _full_schema_chars_cache
     _documents_cache = None
+    _full_schema_chars_cache = None
     _load_documents(db_path)
+    _full_schema_chars(db_path)
+
+
+# Length of the FULL schema text (what Day 2 sent on every question). Only
+# used so the frontend can show how much smaller the retrieved schema is;
+# cached because computing it means reading the database.
+_full_schema_chars_cache: int | None = None
+
+
+def _full_schema_chars(db_path=None) -> int:
+    global _full_schema_chars_cache
+    if db_path is None and _full_schema_chars_cache is not None:
+        return _full_schema_chars_cache
+    size = len(build_schema_text(db_path))
+    if db_path is None:
+        _full_schema_chars_cache = size
+    return size
 
 
 def _tokenize(question: str) -> list[str]:
@@ -327,6 +345,92 @@ def _expand_with_join_neighbors(selected: list[str], cap: int) -> list[str]:
     return result[:cap]
 
 
+@dataclass(frozen=True)
+class RetrievedTableInfo:
+    """One table/view that retrieval chose, and why."""
+    name: str
+    kind: str          # "table" or "view"
+    selected_by: str   # "score" | "fk_expansion" | "fallback"
+    score: int         # 0 for tables that were only pulled in as join partners
+
+
+@dataclass(frozen=True)
+class RetrievalDetails:
+    """Everything retrieval decided for one question. Day 6 added this so the
+    frontend can show WHICH tables were chosen and why; the two older
+    functions below just return one piece of it each."""
+    tables: tuple[RetrievedTableInfo, ...]
+    relationships: tuple[str, ...]
+    schema_text: str          # exactly what is handed to the LLM
+    full_schema_chars: int    # size of the whole schema, for comparison
+
+
+def retrieve_with_details(
+    question: str, top_k: int = DEFAULT_TOP_K, db_path=None
+) -> RetrievalDetails:
+    """The whole retrieval step for one question, with the reasoning kept.
+
+    Scoring, selection, the orders fallback and the one-hop join expansion
+    are exactly what they have been since Day 3 — this only remembers
+    each table's score and whether it was picked by scoring, pulled in as a
+    foreign-key neighbor, or chosen as the fallback.
+    """
+    documents = _load_documents(db_path)
+    tokens = _tokenize(question)
+    scores = {doc.name: _score_document(tokens, doc) for doc in documents.values()}
+
+    scored = sorted(documents.values(), key=lambda doc: scores[doc.name], reverse=True)
+    selected = [doc.name for doc in scored if scores[doc.name] > 0][:top_k]
+
+    used_fallback = not selected
+    if used_fallback:
+        # Nothing matched at all (e.g. a very generic or off-topic
+        # question) — fall back to the hub table rather than sending
+        # nothing, since almost every real question touches orders.
+        selected = ["orders"]
+
+    names = _expand_with_join_neighbors(selected, cap=MAX_DOCUMENTS)
+
+    initial_reason = "fallback" if used_fallback else "score"
+    tables = tuple(
+        RetrievedTableInfo(
+            name=name,
+            kind=documents[name].kind,
+            selected_by=initial_reason if name in selected else "fk_expansion",
+            score=scores.get(name, 0),
+        )
+        for name in names
+        if name in documents
+    )
+    relationships = tuple(
+        rel.as_text()
+        for rel in _RELATIONSHIPS
+        if rel.from_table in names and rel.to_table in names
+    )
+
+    return RetrievalDetails(
+        tables=tables,
+        relationships=relationships,
+        schema_text=_render_schema_text(documents, names, relationships),
+        full_schema_chars=_full_schema_chars(db_path),
+    )
+
+
+def _render_schema_text(
+    documents: dict[str, SchemaDocument],
+    names: list[str],
+    relationship_lines: tuple[str, ...],
+) -> str:
+    doc_lines = [documents[name].as_text() for name in names if name in documents]
+
+    parts = ["Relevant tables for this question (not the full database):", ""]
+    parts += doc_lines
+    if relationship_lines:
+        parts += ["", "How these tables join together:"] + list(relationship_lines)
+    parts += ["", _GENERAL_NOTES]
+    return "\n".join(parts)
+
+
 def retrieve_relevant_tables(
     question: str, top_k: int = DEFAULT_TOP_K, db_path=None
 ) -> list[str]:
@@ -334,25 +438,8 @@ def retrieve_relevant_tables(
     already expanded with their join partners. This is the "retrieve" step
     of RAG, kept separate from text rendering so it's easy to unit test.
     """
-    documents = _load_documents(db_path)
-    tokens = _tokenize(question)
-
-    scored = sorted(
-        documents.values(),
-        key=lambda doc: _score_document(tokens, doc),
-        reverse=True,
-    )
-    selected = [
-        doc.name for doc in scored if _score_document(tokens, doc) > 0
-    ][:top_k]
-
-    if not selected:
-        # Nothing matched at all (e.g. a very generic or off-topic
-        # question) — fall back to the hub table rather than sending
-        # nothing, since almost every real question touches orders.
-        selected = ["orders"]
-
-    return _expand_with_join_neighbors(selected, cap=MAX_DOCUMENTS)
+    details = retrieve_with_details(question, top_k=top_k, db_path=db_path)
+    return [table.name for table in details.tables]
 
 
 def build_relevant_schema_text(
@@ -362,21 +449,4 @@ def build_relevant_schema_text(
     render them (plus the relationships between them) as the schema text
     handed to the LLM in place of the full database schema.
     """
-    documents = _load_documents(db_path)
-    selected_names = retrieve_relevant_tables(question, top_k=top_k, db_path=db_path)
-
-    doc_lines = [
-        documents[name].as_text() for name in selected_names if name in documents
-    ]
-    relationship_lines = [
-        rel.as_text()
-        for rel in _RELATIONSHIPS
-        if rel.from_table in selected_names and rel.to_table in selected_names
-    ]
-
-    parts = ["Relevant tables for this question (not the full database):", ""]
-    parts += doc_lines
-    if relationship_lines:
-        parts += ["", "How these tables join together:"] + relationship_lines
-    parts += ["", _GENERAL_NOTES]
-    return "\n".join(parts)
+    return retrieve_with_details(question, top_k=top_k, db_path=db_path).schema_text
