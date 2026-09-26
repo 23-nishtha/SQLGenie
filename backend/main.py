@@ -1,8 +1,10 @@
 """FastAPI app: the /ask endpoint that ties the whole pipeline together.
 
-Pipeline for POST /ask:
+Pipeline for POST /ask (Day 3 adds the first step):
   question (from the request)
-    -> llm.generate_sql()        turn it into SQL using OpenAI
+    -> schema_retrieval.build_relevant_schema_text()  retrieve only the
+                                                        relevant tables/joins
+    -> llm.generate_sql()        turn it into SQL (mock or OpenAI)
     -> sql_guard.validate_and_prepare()   reject anything unsafe
     -> db.run_query()            execute against the read-only SQLite DB
     -> AskResponse               return question, sql, columns, rows
@@ -12,11 +14,10 @@ Then open:    http://127.0.0.1:8000/docs
 """
 from fastapi import FastAPI, HTTPException
 
-from backend import db, llm, sql_guard
+from backend import db, llm, schema_retrieval, sql_guard
 from backend.config import settings
 from backend.mock_llm import MockQuestionNotFound
 from backend.models import AskRequest, AskResponse
-from backend.schema_context import build_schema_text
 
 app = FastAPI(
     title="SQLGenie API",
@@ -24,15 +25,13 @@ app = FastAPI(
     version="0.1.0",
 )
 
-# The schema doesn't change while the server runs, so we read it once here
-# instead of hitting the database on every request.
-_schema_text_cache: str | None = None
-
 
 @app.on_event("startup")
 def load_schema_on_startup() -> None:
-    global _schema_text_cache
-    _schema_text_cache = build_schema_text()
+    # Reads the DB schema once and caches it inside schema_retrieval, so
+    # each /ask request only does in-memory keyword scoring, not a fresh
+    # SQLite read. See backend/schema_retrieval.py for the retrieval logic.
+    schema_retrieval.init_documents()
 
 
 @app.get("/health")
@@ -47,11 +46,34 @@ def health_check():
     }
 
 
+@app.get("/debug/retrieve")
+def debug_retrieve(question: str):
+    """DEVELOPMENT/DEBUGGING ENDPOINT — not part of the normal user flow.
+
+    Shows exactly what backend/schema_retrieval.py would send the LLM for a
+    given question, WITHOUT calling OpenAI (no network call, no API key
+    needed, works in either SQLGENIE_LLM_MODE). Handy for seeing/tuning
+    which tables get retrieved for a question while building or debugging
+    Day 3's retrieval logic.
+
+    Try it at: /debug/retrieve?question=What is the average review score?
+    """
+    selected_tables = schema_retrieval.retrieve_relevant_tables(question)
+    schema_text = schema_retrieval.build_relevant_schema_text(question)
+    return {
+        "question": question,
+        "retrieved_tables": selected_tables,
+        "schema_text_sent_to_llm": schema_text,
+    }
+
+
 @app.post("/ask", response_model=AskResponse)
 def ask(request: AskRequest) -> AskResponse:
-    schema_text = _schema_text_cache or build_schema_text()
+    # Step 1 (Day 3): retrieve only the schema relevant to this question,
+    # instead of sending the LLM the entire database every time.
+    schema_text = schema_retrieval.build_relevant_schema_text(request.question)
 
-    # Step 1: natural language -> SQL (mock or OpenAI, see llm.py)
+    # Step 2: natural language -> SQL (mock or OpenAI, see llm.py)
     try:
         raw_sql = llm.generate_sql(request.question, schema_text)
     except MockQuestionNotFound as exc:
@@ -62,13 +84,13 @@ def ask(request: AskRequest) -> AskResponse:
         # Covers missing API key, network errors, and OpenAI API errors alike.
         raise HTTPException(status_code=502, detail=f"Could not generate SQL: {exc}") from exc
 
-    # Step 2: validate the SQL before it goes anywhere near the database
+    # Step 3: validate the SQL before it goes anywhere near the database
     try:
         safe_sql = sql_guard.validate_and_prepare(raw_sql)
     except sql_guard.SqlValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    # Step 3: execute against the read-only database
+    # Step 4: execute against the read-only database
     try:
         columns, rows = db.run_query(safe_sql)
     except db.QueryExecutionError as exc:

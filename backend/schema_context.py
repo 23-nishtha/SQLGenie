@@ -37,22 +37,45 @@ def _fetch_tables_and_views(conn: sqlite3.Connection) -> list[tuple[str, str]]:
     return [(row[0], row[1]) for row in rows]
 
 
-def build_schema_text(db_path=None) -> str:
-    """Connect to the SQLite DB and build the schema description as one string.
+def get_table_columns(db_path=None) -> dict[str, dict]:
+    """Read every table/view straight out of SQLite.
 
-    Called once at startup (see main.py) and cached, since the schema
-    doesn't change while the API is running.
+    Returns {name: {"kind": "table" | "view", "columns": ["col_name TYPE", ...]}}.
+
+    This is the one place that actually queries the database for schema
+    shape. Both `build_schema_text` (the full-schema text used since Day 2)
+    and `backend/schema_retrieval.py` (the Day 3 per-question subset) call
+    this instead of querying SQLite themselves, so column names/types can
+    never drift out of sync between the two.
     """
     db_path = db_path or settings.DATABASE_PATH
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
-        lines = []
+        result: dict[str, dict] = {}
         for name, obj_type in _fetch_tables_and_views(conn):
             columns = conn.execute(f"PRAGMA table_info('{name}')").fetchall()
             # PRAGMA table_info columns: (cid, name, type, notnull, dflt_value, pk)
-            col_descriptions = [f"{col[1]} {col[2]}".strip() for col in columns]
-            label = "TABLE" if obj_type == "table" else "VIEW"
-            lines.append(f"{label} {name}({', '.join(col_descriptions)})")
-        return "\n".join(lines) + "\n\n" + SCHEMA_NOTES
+            result[name] = {
+                "kind": "table" if obj_type == "table" else "view",
+                "columns": [f"{col[1]} {col[2]}".strip() for col in columns],
+            }
+        return result
     finally:
         conn.close()
+
+
+def build_schema_text(db_path=None) -> str:
+    """Build the FULL schema description (every table/view) as one string.
+
+    This is the Day 2 behavior, kept as-is: every column of every table,
+    always. It's still available (e.g. for debugging, or a future admin
+    view) but the main /ask pipeline no longer uses it as of Day 3 — see
+    backend/schema_retrieval.py, which sends the LLM only the tables
+    relevant to each question instead of the whole schema every time.
+    """
+    tables = get_table_columns(db_path)
+    lines = []
+    for name, info in tables.items():
+        label = "TABLE" if info["kind"] == "table" else "VIEW"
+        lines.append(f"{label} {name}({', '.join(info['columns'])})")
+    return "\n".join(lines) + "\n\n" + SCHEMA_NOTES

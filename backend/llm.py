@@ -13,8 +13,10 @@ from backend.mock_llm import generate_sql_mock
 
 SYSTEM_PROMPT_TEMPLATE = """You are a SQL generator for a SQLite database.
 
-Given a database schema and a natural-language question, output ONE valid
-SQLite SELECT query that answers the question. Rules:
+You are given a curated, relevant SUBSET of the database schema below (not
+necessarily every table that exists), selected for this specific question.
+Given that schema and a natural-language question, output ONE valid SQLite
+SELECT query that answers the question. Rules:
 - Output ONLY the SQL query. No explanations, no markdown, no comments.
 - Use only the tables/columns/views listed below. Do not invent columns.
 - Only generate read-only queries: SELECT (optionally with WITH ... SELECT).
@@ -25,7 +27,7 @@ SQLite SELECT query that answers the question. Rules:
 - If the question is ambiguous, make a reasonable assumption rather than
   asking for clarification (you cannot ask follow-up questions).
 
-Database schema:
+Relevant schema for this question:
 {schema}
 """
 
