@@ -14,6 +14,18 @@ string-searching for forbidden words. That matters because a naive
 `"DELETE" in sql.upper()` check would also block a harmless query like
 `SELECT * FROM order_reviews WHERE review_comment_message LIKE '%delete%'`,
 where "delete" is just data, not a SQL keyword.
+
+Day 4 edge case worth knowing (and worth being able to explain): SQLite
+allows a CTE to be followed by an INSERT/UPDATE/DELETE instead of a SELECT,
+e.g. `WITH t AS (SELECT 1) DELETE FROM orders`. Checking only the FIRST
+keyword (rule 1, above) would let that through, since the statement does
+start with "WITH". It still gets rejected, though, because rule 2 scans
+EVERY token in the statement, not just the first one — so the DELETE
+keyword later in the string is caught regardless of what the statement
+started with. This is why the guard has two checks instead of one: the
+"must start with SELECT/WITH" allow-list is the primary defense, and the
+"scan every token for a forbidden keyword" deny-list is what catches
+things an allow-list alone would miss.
 """
 import sqlparse
 from sqlparse.tokens import DDL, DML, Keyword
