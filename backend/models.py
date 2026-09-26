@@ -14,3 +14,5 @@ class AskResponse(BaseModel):
     columns: list[str]
     rows: list[dict[str, Any]]
     row_count: int
+    attempts: int = 1              # Day 5: how many tries it took (1 = no correction needed)
+    corrected: bool = False        # Day 5: True if an earlier attempt failed and a later one fixed it

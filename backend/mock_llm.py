@@ -68,6 +68,36 @@ _MOCK_ANSWERS: dict[str, str] = {
 }
 
 
+# Day 5 self-correction scenarios: each entry scripts a small multi-step
+# conversation, so backend/agent.py's error-driven retry loop can be tested
+# end-to-end without any OpenAI call.
+#
+# "initial" is what generate_sql_mock() returns on the FIRST try — it's
+# deliberately wrong SQL that passes sql_guard.py (it's a normal-looking
+# SELECT) but fails for real against the real olist.db (a column/table
+# that doesn't exist), producing a genuine sqlite3 error, not a fake one.
+# "corrections" is the sequence of what correct_sql_mock() returns for the
+# 1st, 2nd, ... correction attempt.
+_MOCK_CORRECTION_SCENARIOS: dict[str, dict] = {
+    "how many orders were placed in 2017": {
+        "initial": "SELECT COUNT(*) FROM orders WHERE order_year = 2017",  # order_year doesn't exist
+        "corrections": [
+            # Fixed on the first correction attempt: no such column existed
+            # above, so this uses the real column with strftime() instead.
+            "SELECT COUNT(*) AS orders_in_2017 FROM orders "
+            "WHERE strftime('%Y', order_purchase_timestamp) = '2017'",
+        ],
+    },
+    "this question always fails even after correction": {
+        "initial": "SELECT * FROM not_a_real_table",
+        "corrections": [
+            "SELECT * FROM still_not_a_real_table",  # 1st correction: still broken
+            "SELECT * FROM also_not_a_real_table",   # 2nd correction: still broken -> retries exhausted
+        ],
+    },
+}
+
+
 class MockQuestionNotFound(ValueError):
     """Raised when the question isn't one mock mode knows how to answer."""
 
@@ -82,11 +112,41 @@ def _normalize(question: str) -> str:
 def generate_sql_mock(question: str) -> str:
     """Look up canned SQL for `question`. Raises MockQuestionNotFound if unknown."""
     key = _normalize(question)
+    if key in _MOCK_CORRECTION_SCENARIOS:
+        return _MOCK_CORRECTION_SCENARIOS[key]["initial"]
     if key not in _MOCK_ANSWERS:
-        supported = "\n  - ".join(_MOCK_ANSWERS)
+        supported = "\n  - ".join((*_MOCK_ANSWERS, *_MOCK_CORRECTION_SCENARIOS))
         raise MockQuestionNotFound(
             "Mock LLM mode doesn't recognize this question. Try one of:\n"
             f"  - {supported}\n"
             "(Or set SQLGENIE_LLM_MODE=openai in .env to use the real model instead.)"
         )
     return _MOCK_ANSWERS[key]
+
+
+def correct_sql_mock(question: str, attempt_number: int) -> str:
+    """Look up the scripted correction for `question`'s `attempt_number`
+    (1 = first correction, 2 = second correction, ...).
+
+    Real OpenAI correction reads the actual database error and reasons
+    about it; mock mode can't do that, so it's a scripted stand-in — a
+    fixed, numbered sequence of "next things to try" per question. That's
+    enough to exercise the retry loop in backend/agent.py for real, without
+    needing a real model to actually understand the error.
+    """
+    key = _normalize(question)
+    scenario = _MOCK_CORRECTION_SCENARIOS.get(key)
+    if scenario is None:
+        raise MockQuestionNotFound(
+            f"Mock LLM mode has no scripted self-correction for {question!r}. "
+            "Self-correction scenarios are only defined for: "
+            + ", ".join(_MOCK_CORRECTION_SCENARIOS)
+        )
+    corrections = scenario["corrections"]
+    index = attempt_number - 1
+    if index < 0 or index >= len(corrections):
+        raise MockQuestionNotFound(
+            f"Mock LLM mode ran out of scripted corrections for {question!r} "
+            f"after {len(corrections)} attempt(s)."
+        )
+    return corrections[index]

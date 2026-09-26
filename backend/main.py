@@ -1,20 +1,24 @@
 """FastAPI app: the /ask endpoint that ties the whole pipeline together.
 
-Pipeline for POST /ask (Day 3 adds the first step):
+Pipeline for POST /ask (Day 5 wraps generation+validation+execution in an
+error-driven self-correction loop — see backend/agent.py for the retry
+logic itself; this file just calls it and maps the outcome to HTTP):
   question (from the request)
-    -> schema_retrieval.build_relevant_schema_text()  retrieve only the
-                                                        relevant tables/joins
-    -> llm.generate_sql()        turn it into SQL (mock or OpenAI)
-    -> sql_guard.validate_and_prepare()   reject anything unsafe
-    -> db.run_query()            execute against the read-only SQLite DB
-    -> AskResponse               return question, sql, columns, rows
+    -> agent.answer_question()
+         -> schema_retrieval.build_relevant_schema_text()  retrieve schema
+         -> llm.generate_sql()                             mock or OpenAI
+         -> sql_guard.validate_and_prepare()                same guard, every attempt
+         -> db.run_query()                                  read-only SQLite
+         -> on failure: llm.correct_sql(), then retry the same validate+execute,
+            up to agent.MAX_CORRECTION_ATTEMPTS times
+    -> AskResponse       question, sql, columns, rows, attempts, corrected
 
 Run it with:  uvicorn backend.main:app --reload
 Then open:    http://127.0.0.1:8000/docs
 """
 from fastapi import FastAPI, HTTPException
 
-from backend import db, llm, schema_retrieval, sql_guard
+from backend import agent, schema_retrieval, sql_guard
 from backend.config import settings
 from backend.mock_llm import MockQuestionNotFound
 from backend.models import AskRequest, AskResponse
@@ -69,37 +73,36 @@ def debug_retrieve(question: str):
 
 @app.post("/ask", response_model=AskResponse)
 def ask(request: AskRequest) -> AskResponse:
-    # Step 1 (Day 3): retrieve only the schema relevant to this question,
-    # instead of sending the LLM the entire database every time.
-    schema_text = schema_retrieval.build_relevant_schema_text(request.question)
-
-    # Step 2: natural language -> SQL (mock or OpenAI, see llm.py)
+    # backend/agent.py runs the whole pipeline: retrieval -> generate SQL ->
+    # validate -> execute, and on a database error, asks the LLM to correct
+    # the SQL and tries again (up to agent.MAX_CORRECTION_ATTEMPTS times).
+    # Every attempt, including every correction, still goes through the
+    # exact same sql_guard.validate_and_prepare() — see agent.py's docstring.
     try:
-        raw_sql = llm.generate_sql(request.question, schema_text)
+        result = agent.answer_question(request.question)
     except MockQuestionNotFound as exc:
         # The user's fault (an unsupported question in mock mode), not a
         # server/API failure, so this gets a 400 rather than a 502.
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except sql_guard.SqlValidationError as exc:
+        # A guard rejection is never retried (see agent.py) — surfaced
+        # immediately, same behavior as before Day 5.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except agent.PipelineError as exc:
+        # Every attempt (initial + all corrections) failed. str(exc) is
+        # agent.py's own clean, multi-line summary — never a raw traceback.
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     except Exception as exc:
-        # Covers missing API key, network errors, and OpenAI API errors alike.
+        # Covers missing API key, network errors, and other OpenAI API
+        # errors — from either the initial generation or a correction call.
         raise HTTPException(status_code=502, detail=f"Could not generate SQL: {exc}") from exc
 
-    # Step 3: validate the SQL before it goes anywhere near the database
-    try:
-        safe_sql = sql_guard.validate_and_prepare(raw_sql)
-    except sql_guard.SqlValidationError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-    # Step 4: execute against the read-only database
-    try:
-        columns, rows = db.run_query(safe_sql)
-    except db.QueryExecutionError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
     return AskResponse(
-        question=request.question,
-        sql=safe_sql,
-        columns=columns,
-        rows=rows,
-        row_count=len(rows),
+        question=result.question,
+        sql=result.sql,
+        columns=result.columns,
+        rows=result.rows,
+        row_count=result.row_count,
+        attempts=len(result.attempts),
+        corrected=result.corrected,
     )
