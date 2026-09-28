@@ -197,6 +197,93 @@ OLIST_SCHEMA_PROFILE = SchemaProfile(
     general_notes=_OLIST_NOTES,
 )
 
+
+# ---------------------------------------------------------------------------
+# Football (Day 8). One table, so `relationships` is empty — there's
+# nothing to join. Keywords/description still help retrieval and give the
+# LLM's prompt useful hints even with only one table to pick from.
+# ---------------------------------------------------------------------------
+
+_FOOTBALL_METADATA: dict[str, tuple[str, frozenset[str]]] = {
+    "results": (
+        "One row per international football (soccer) match, 1872-present: "
+        "the two teams, final score, competition, and where it was played. "
+        "winner and goal_diff are derived columns (not in the original data).",
+        frozenset({
+            "match", "matches", "game", "games", "result", "results",
+            "score", "scores", "scored", "win", "wins", "won", "winner",
+            "loss", "loses", "lost", "draw", "draws", "drew", "tie",
+            "team", "teams", "goal", "goals", "difference", "diff",
+            "tournament", "tournaments", "competition", "cup", "world cup",
+            "qualifier", "qualification", "friendly", "friendlies",
+            "season", "year", "home", "away", "neutral", "venue", "city",
+            "country", "opponent", "versus", "vs",
+        }),
+    ),
+}
+
+_FOOTBALL_NOTES = (
+    "General notes:\n"
+    "- goal_diff is always a non-negative number (it's an absolute "
+    "difference); use home_score - away_score directly if you need the "
+    "SIGNED difference (positive = home team ahead).\n"
+    "- winner is 'home', 'away' or 'draw' — a team can appear in either "
+    "home_team or away_team, so compare against both when asking about one "
+    "team's overall record (e.g. wins as home_team OR away_team).\n"
+    "- neutral is 1 when the match was played at a neutral venue (INTEGER "
+    "0/1, not TEXT).\n"
+    "- date is text in 'YYYY-MM-DD' format; extract the year with "
+    "strftime('%Y', date) or substr(date, 1, 4) for season/year questions."
+)
+
+FOOTBALL_SCHEMA_PROFILE = SchemaProfile(
+    metadata=_FOOTBALL_METADATA,
+    relationships=(),
+    general_notes=_FOOTBALL_NOTES,
+)
+
+
+# ---------------------------------------------------------------------------
+# Movies (Day 8). Also one table.
+# ---------------------------------------------------------------------------
+
+_MOVIES_METADATA: dict[str, tuple[str, frozenset[str]]] = {
+    "movies": (
+        "One row per movie (IMDb Top 1000): title, year, rating, genre, "
+        "director, cast, votes and box-office gross. primary_genre is a "
+        "derived column (the first of possibly several genres listed).",
+        frozenset({
+            "movie", "movies", "film", "films", "title", "titles",
+            "rating", "ratings", "rated", "score", "imdb", "vote", "votes",
+            "genre", "genres", "category", "categories", "director",
+            "directors", "directed", "cast", "actor", "actors", "actress",
+            "star", "stars", "starring", "year", "years", "released",
+            "release", "decade", "runtime", "duration", "minutes", "long",
+            "certificate", "rated", "gross", "revenue", "earned",
+            "box office", "highest", "best", "top", "worst",
+        }),
+    ),
+}
+
+_MOVIES_NOTES = (
+    "General notes:\n"
+    "- Use primary_genre for grouping/filtering by a single genre — genre "
+    "holds the original comma-separated list (e.g. 'Action, Drama, Sport') "
+    "and grouping by it directly treats each combination as one category.\n"
+    "- gross and meta_score and certificate can be NULL (missing in the "
+    "source data) — use IS NOT NULL if a question implies only movies with "
+    "that data available (e.g. 'highest grossing').\n"
+    "- runtime_minutes is a plain INTEGER (already stripped of ' min').\n"
+    "- released_year is a plain INTEGER."
+)
+
+MOVIES_SCHEMA_PROFILE = SchemaProfile(
+    metadata=_MOVIES_METADATA,
+    relationships=(),
+    general_notes=_MOVIES_NOTES,
+)
+
+
 # The profile used for any dataset with no curated entry below — every
 # upload, and any future built-in dataset before someone writes it a real
 # profile. Empty metadata/relationships isn't a broken state: retrieval
@@ -214,6 +301,8 @@ DEFAULT_SCHEMA_PROFILE = SchemaProfile(
 # DEFAULT_SCHEMA_PROFILE (see get_schema_profile below).
 _SCHEMA_PROFILES: dict[str, SchemaProfile] = {
     "olist": OLIST_SCHEMA_PROFILE,
+    "football": FOOTBALL_SCHEMA_PROFILE,
+    "movies": MOVIES_SCHEMA_PROFILE,
 }
 
 

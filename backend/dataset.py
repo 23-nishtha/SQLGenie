@@ -54,7 +54,7 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-from backend.config import settings
+from backend.config import PROJECT_ROOT, settings
 
 # The complete list of themes the backend may ever name. A typo in a profile
 # fails validation at startup instead of silently shipping an unknown key to
@@ -135,6 +135,53 @@ OLIST_PROFILE = DatasetProfile(
     ],
 )
 
+# Day 8: the second and third built-in datasets. Their .db files are built
+# by database/football/build_db.py and database/movies/build_db.py from the
+# raw CSVs in database/football/raw/ and database/movies/raw/ — see those
+# scripts for how each was cleaned/derived. schema_profile_id points at the
+# matching entry in backend/schema_profiles.py.
+
+FOOTBALL_PROFILE = DatasetProfile(
+    id="football",
+    name="International Football Results",
+    domain="sports",
+    theme="football",
+    source="built_in",
+    description=(
+        "International football (soccer) match results, 1872-present: two "
+        "teams, final score, competition, venue, and derived winner/goal "
+        "difference columns."
+    ),
+    example_questions=[
+        "Which team has the most wins?",
+        "How many matches are there?",
+        "What is the highest goal difference in a match?",
+        "What is the average number of goals scored per match?",
+        "How many matches has Brazil played?",
+        "How many matches were played in 2018?",
+    ],
+)
+
+MOVIES_PROFILE = DatasetProfile(
+    id="movies",
+    name="IMDb Top 1000 Movies",
+    domain="entertainment",
+    theme="entertainment",
+    source="built_in",
+    description=(
+        "The IMDb Top 1000 movies: title, year, rating, genre, director, "
+        "cast, votes and box-office gross."
+    ),
+    example_questions=[
+        "What are the top 5 highest rated movies?",
+        "What is the average IMDB rating?",
+        "How many movies are there?",
+        "Which director has the most movies?",
+        "What is the average rating by genre?",
+        "How many movies were released after 2010?",
+    ],
+)
+
 
 # ---------------------------------------------------------------------------
 # Registry + active pointer. Not exported directly (leading underscore) —
@@ -165,6 +212,12 @@ def register_dataset(
 
 
 register_dataset(OLIST_PROFILE, settings.DATABASE_PATH, schema_profile_id="olist")
+register_dataset(
+    FOOTBALL_PROFILE, PROJECT_ROOT / "database/football/football.db", schema_profile_id="football"
+)
+register_dataset(
+    MOVIES_PROFILE, PROJECT_ROOT / "database/movies/movies.db", schema_profile_id="movies"
+)
 
 
 def _get_active_record() -> _DatasetRecord:

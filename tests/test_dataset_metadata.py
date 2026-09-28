@@ -102,13 +102,16 @@ def test_unknown_dataset_raises_a_clear_error(monkeypatch):
     misconfiguration, which this simulates directly on the pointer itself
     rather than on `settings` (which get_active_dataset() no longer reads).
     """
-    monkeypatch.setattr(dataset, "_active_dataset_id", "football")
+    # "cricket" is deliberately never registered (unlike "football"/"movies",
+    # which became real built-in datasets in Day 8) — it stands in for any
+    # dataset id that doesn't exist.
+    monkeypatch.setattr(dataset, "_active_dataset_id", "cricket")
     with pytest.raises(UnknownDatasetError, match="olist"):
         dataset.get_active_dataset()
 
 
 def test_startup_fails_fast_on_an_unknown_dataset(monkeypatch):
-    monkeypatch.setattr(dataset, "_active_dataset_id", "football")
+    monkeypatch.setattr(dataset, "_active_dataset_id", "cricket")
     with pytest.raises(UnknownDatasetError):
         with TestClient(app):
             pass
@@ -117,8 +120,8 @@ def test_startup_fails_fast_on_an_unknown_dataset(monkeypatch):
 def test_selecting_an_unknown_dataset_id_is_rejected_not_silently_accepted():
     """The actual Day 7 way an unknown dataset id gets rejected in normal
     operation: via set_active_dataset(), not a corrupted env var."""
-    with pytest.raises(UnknownDatasetError, match="football"):
-        dataset.set_active_dataset("football")
+    with pytest.raises(UnknownDatasetError, match="cricket"):
+        dataset.set_active_dataset("cricket")
 
 
 # ---------------------------------------------------------------------------

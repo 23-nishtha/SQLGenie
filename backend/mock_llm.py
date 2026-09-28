@@ -65,6 +65,47 @@ _MOCK_ANSWERS: dict[str, str] = {
     "what is the total revenue": (
         "SELECT SUM(price + freight_value) AS total_revenue FROM order_items"
     ),
+
+    # --- Day 8: Football dataset (table: results) ---
+    # These only produce correct results when the "football" dataset is
+    # active — same as the Olist answers above only make sense for
+    # "olist". Mock mode doesn't know which dataset is active; it's just a
+    # lookup table. Picking a question here while the WRONG dataset is
+    # active fails at execution (no such table), exactly like it would for
+    # a real LLM asked to write SQL against a schema it wasn't shown.
+    "which team has the most wins": (
+        "SELECT team, COUNT(*) AS wins FROM ("
+        "  SELECT home_team AS team FROM results WHERE winner = 'home'"
+        "  UNION ALL"
+        "  SELECT away_team AS team FROM results WHERE winner = 'away'"
+        ") GROUP BY team ORDER BY wins DESC LIMIT 1"
+    ),
+    "how many matches are there": "SELECT COUNT(*) AS total_matches FROM results",
+    "what is the highest goal difference in a match": (
+        "SELECT MAX(goal_diff) AS highest_goal_diff FROM results"
+    ),
+    "what is the average number of goals scored per match": (
+        "SELECT AVG(home_score + away_score) AS average_goals FROM results"
+    ),
+    "how many matches has brazil played": (
+        "SELECT COUNT(*) AS brazil_matches FROM results "
+        "WHERE home_team = 'Brazil' OR away_team = 'Brazil'"
+    ),
+
+    # --- Day 8: Movies dataset (table: movies) ---
+    "what are the top 5 highest rated movies": (
+        "SELECT series_title, imdb_rating FROM movies ORDER BY imdb_rating DESC LIMIT 5"
+    ),
+    "what is the average imdb rating": "SELECT AVG(imdb_rating) AS average_rating FROM movies",
+    "how many movies are there": "SELECT COUNT(*) AS total_movies FROM movies",
+    "which director has the most movies": (
+        "SELECT director, COUNT(*) AS movie_count FROM movies "
+        "GROUP BY director ORDER BY movie_count DESC LIMIT 1"
+    ),
+    "what is the average rating by genre": (
+        "SELECT primary_genre, AVG(imdb_rating) AS average_rating FROM movies "
+        "GROUP BY primary_genre ORDER BY average_rating DESC"
+    ),
 }
 
 
@@ -93,6 +134,22 @@ _MOCK_CORRECTION_SCENARIOS: dict[str, dict] = {
         "corrections": [
             "SELECT * FROM still_not_a_real_table",  # 1st correction: still broken
             "SELECT * FROM also_not_a_real_table",   # 2nd correction: still broken -> retries exhausted
+        ],
+    },
+    # Day 8: one self-correction scenario per new dataset, same shape as
+    # Olist's above — a plausible-looking but wrong column name, fixed on
+    # the first retry with the real column/expression.
+    "how many matches were played in 2018": {
+        "initial": "SELECT COUNT(*) FROM results WHERE year = 2018",  # `year` doesn't exist
+        "corrections": [
+            "SELECT COUNT(*) AS matches_in_2018 FROM results "
+            "WHERE strftime('%Y', date) = '2018'",
+        ],
+    },
+    "how many movies were released after 2010": {
+        "initial": "SELECT COUNT(*) FROM movies WHERE release_year > 2010",  # typo: should be released_year
+        "corrections": [
+            "SELECT COUNT(*) AS movies_after_2010 FROM movies WHERE released_year > 2010",
         ],
     },
 }

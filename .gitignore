@@ -12,6 +12,7 @@ venv/
 
 # Raw datasets
 database/raw/
+database/*/raw/
 
 # User-uploaded datasets (Day 7): converted SQLite files, never committed —
 # these are runtime data a user supplied, not project source.

@@ -48,15 +48,27 @@ def test_register_dataset_rejects_a_duplicate_id():
 
 
 def test_set_active_dataset_switches_and_returns_the_profile():
-    fake_path = dataset.get_active_database_path()  # reuse a real, valid file
-    profile = DatasetProfile(
-        id="football", name="Football", domain="sports", theme="football", description="", source="built_in",
-    )
-    dataset.register_dataset(profile, fake_path, schema_profile_id="football")
-
+    """Day 8: football is a real, already-registered built-in dataset now —
+    no need to fake-register one to test switching mechanics."""
     result = dataset.set_active_dataset("football")
     assert result.id == "football"
     assert dataset.get_active_dataset().id == "football"
+    assert dataset.get_active_database_path().name == "football.db"
+
+
+def test_register_dataset_allows_adding_a_new_dataset_generically():
+    """The underlying mechanism (independent of any specific dataset like
+    football/movies): register_dataset() + set_active_dataset() works for
+    any brand-new id."""
+    fake_path = dataset.get_active_database_path()  # reuse a real, valid file
+    profile = DatasetProfile(
+        id="cricket", name="Cricket", domain="sports", theme="football", description="", source="built_in",
+    )
+    dataset.register_dataset(profile, fake_path, schema_profile_id="cricket")
+
+    result = dataset.set_active_dataset("cricket")
+    assert result.id == "cricket"
+    assert dataset.get_active_dataset().id == "cricket"
     assert dataset.get_active_database_path() == fake_path
 
 
@@ -82,21 +94,17 @@ def test_get_datasets_lists_olist_as_active(client):
     body = client.get("/datasets").json()
     assert body["active"] == "olist"
     ids = [d["id"] for d in body["datasets"]]
-    assert "olist" in ids
+    assert {"olist", "football", "movies"} <= set(ids)
     assert all("database_path" not in d for d in body["datasets"])
 
 
 def test_select_endpoint_switches_the_active_dataset(client):
-    fake_path = dataset.get_active_database_path()
-    dataset.register_dataset(
-        DatasetProfile(id="movies", name="Movies", domain="entertainment", theme="entertainment", description=""),
-        fake_path,
-        schema_profile_id="movies",
-    )
-
+    """Day 8: movies is a real, already-registered built-in dataset."""
     response = client.post("/datasets/movies/select")
     assert response.status_code == 200
-    assert response.json() == {"id": "movies", "name": "Movies", "domain": "entertainment", "theme": "entertainment"}
+    assert response.json() == {
+        "id": "movies", "name": "IMDb Top 1000 Movies", "domain": "entertainment", "theme": "entertainment",
+    }
     assert client.get("/dataset").json()["id"] == "movies"
 
 
@@ -109,19 +117,15 @@ def test_select_endpoint_404s_on_an_unknown_id(client):
 
 
 def test_dataset_endpoints_never_mention_a_filesystem_path(client):
-    dataset.register_dataset(
-        DatasetProfile(id="football", name="Football", domain="sports", theme="football", description=""),
-        dataset.get_active_database_path(),
-        schema_profile_id="football",
-    )
     responses = [
         client.get("/dataset"),
         client.get("/datasets"),
         client.post("/datasets/football/select"),
     ]
-    db_path_str = str(dataset.get_active_database_path())
     for response in responses:
         text = response.text
         assert "database_path" not in text
         assert "olist.db" not in text
-        assert db_path_str not in text
+        assert "football.db" not in text
+        assert "movies.db" not in text
+        assert str(dataset.get_active_database_path()) not in text
