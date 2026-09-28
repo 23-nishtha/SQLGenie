@@ -17,13 +17,13 @@ and maps the outcome to HTTP):
 Run it with:  uvicorn backend.main:app --reload
 Then open:    http://127.0.0.1:8000/docs
 """
-from fastapi import FastAPI
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from backend import agent, dataset, schema_retrieval
+from backend import agent, csv_upload, dataset, schema_retrieval
 from backend.config import settings
-from backend.dataset import DatasetProfile
+from backend.dataset import DatasetListResponse, DatasetProfile, DatasetSummary
 from backend.models import (
     AskRequest, AskResponse, ErrorInfo, ErrorResponse, ErrorType, LlmInfo,
 )
@@ -77,10 +77,76 @@ def health_check():
 
 @app.get("/dataset", response_model=DatasetProfile)
 def get_dataset() -> DatasetProfile:
-    """Which dataset is being queried: its name, domain, a `theme` key the
-    frontend maps to its own predefined theme (never CSS), and example
-    questions to start from."""
+    """Which dataset is CURRENTLY ACTIVE: its name, domain, a `theme` key
+    the frontend maps to its own predefined theme (never CSS), and example
+    questions to start from. Changes after POST /datasets/{id}/select or a
+    successful POST /datasets/upload."""
     return dataset.get_active_dataset()
+
+
+@app.get("/datasets", response_model=DatasetListResponse)
+def list_datasets() -> DatasetListResponse:
+    """Every dataset SQLGenie currently knows about — the built-in ones
+    plus any uploaded so far this session — and which one is active. This
+    is what the frontend's "[ Select Dataset ]" list is built from."""
+    return DatasetListResponse(
+        active=dataset.get_active_dataset().id,
+        datasets=dataset.list_datasets(),
+    )
+
+
+@app.post("/datasets/{dataset_id}/select", response_model=DatasetSummary)
+def select_dataset(dataset_id: str) -> DatasetSummary:
+    """Make `dataset_id` the active dataset — every /ask call afterward
+    queries it. 404s with a clear message if the id isn't registered."""
+    try:
+        profile = dataset.set_active_dataset(dataset_id)
+    except dataset.UnknownDatasetError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    # Pre-warm the retrieval cache for the newly active dataset, same as
+    # what happens for the default dataset at startup — otherwise the
+    # FIRST /ask after switching would pay for a schema read that every
+    # later one wouldn't.
+    schema_retrieval.init_documents()
+    return profile.summary()
+
+
+@app.post("/datasets/upload", response_model=DatasetProfile)
+def upload_dataset(file: UploadFile = File(...)) -> DatasetProfile:
+    """Upload one CSV, convert it to a single-table SQLite database (see
+    backend/csv_upload.py for the validation/sanitization this goes
+    through), register it, and make it the active dataset immediately —
+    so the very next /ask call answers questions about it. Never returns a
+    filesystem path; see csv_upload.py's module docstring for the full
+    security model this endpoint relies on.
+    """
+    try:
+        result = csv_upload.build_dataset_from_csv(file.filename or "", file.file)
+    except csv_upload.CsvValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    profile = DatasetProfile(
+        id=result.dataset_id,
+        name=result.display_name,
+        domain=result.domain,
+        theme=result.theme,
+        source="uploaded",
+        description=(
+            f"Uploaded dataset \"{result.display_name}\": {result.row_count} rows, "
+            f"{len(result.column_names)} columns."
+        ),
+        example_questions=[
+            f"How many rows are in {result.table_name}?",
+            "Show me 10 sample rows.",
+        ],
+    )
+    # schema_profile_id = the dataset's own id: schema_profiles.py has no
+    # curated entry for it, so get_schema_profile() falls back to
+    # DEFAULT_SCHEMA_PROFILE automatically — no registration needed there.
+    dataset.register_dataset(profile, result.database_path, schema_profile_id=result.dataset_id)
+    dataset.set_active_dataset(profile.id)
+    schema_retrieval.init_documents()
+    return profile
 
 
 @app.get("/debug/retrieve")

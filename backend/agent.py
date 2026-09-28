@@ -51,7 +51,7 @@ _validate_and_execute() is still the only place SQL goes from text to rows.
 """
 from dataclasses import dataclass, field
 
-from backend import db, llm, schema_retrieval, sql_guard
+from backend import dataset, db, llm, schema_retrieval, sql_guard
 from backend.mock_llm import MockQuestionNotFound
 from backend.models import (
     DbExecutionData, ErrorType, QuestionData, ResultData, RetrievedTable,
@@ -199,6 +199,11 @@ def run_pipeline(question: str) -> PipelineRun:
     would just be hoping for a different unsafe answer. It ends the run
     immediately, exactly as it did before Day 6.
     """
+    # Captured once, at the start of the run, so a trace is always
+    # consistent about which dataset it describes even if the active
+    # dataset were somehow changed mid-request.
+    active_dataset = dataset.get_active_dataset().summary()
+
     recorder = TraceRecorder()
     recorder.add("question", "success", 0, QuestionData(text=question), 0.0)
 
@@ -209,6 +214,7 @@ def run_pipeline(question: str) -> PipelineRun:
                 attempts=attempts_made,
                 max_correction_attempts=MAX_CORRECTION_ATTEMPTS,
                 corrected=False,
+                dataset=active_dataset,
             ),
             error=exc,
             error_type=_classify_error(exc, failed_step),
@@ -332,6 +338,7 @@ def run_pipeline(question: str) -> PipelineRun:
                 attempts=len(attempts),
                 max_correction_attempts=MAX_CORRECTION_ATTEMPTS,
                 corrected=result.corrected,
+                dataset=active_dataset,
             ),
             result=result,
         )

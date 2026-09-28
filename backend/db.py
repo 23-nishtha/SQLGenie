@@ -1,12 +1,17 @@
-"""Runs an already-validated SQL query against olist.db and returns the rows.
+"""Runs an already-validated SQL query against the active dataset's SQLite
+file and returns the rows.
 
 Second safety layer (the first is sql_guard.py): the connection itself is
 opened read-only, and PRAGMA query_only is set, so even a query that slipped
-past validation cannot modify the database.
+past validation cannot modify the database. This is unchanged from Day 2 —
+Day 7 only changes WHICH file it opens by default (backend/dataset.py's
+active dataset, instead of a single fixed settings.DATABASE_PATH), not how
+it opens it or what it will and won't execute.
 """
 import sqlite3
 import time
 
+from backend import dataset
 from backend.config import settings
 
 
@@ -26,21 +31,27 @@ def _make_progress_handler(deadline: float):
     return handler
 
 
-def run_query(sql: str) -> tuple[list[str], list[dict]]:
-    """Execute `sql` (already validated as a single SELECT) read-only.
+def run_query(sql: str, db_path=None) -> tuple[list[str], list[dict]]:
+    """Execute `sql` (already validated as a single SELECT) read-only,
+    against `db_path` — or, if not given, whichever dataset is currently
+    active (backend/dataset.py).
 
     Returns (column_names, rows) where rows is a list of {column: value} dicts.
     """
-    if not settings.DATABASE_PATH.exists():
+    db_path = db_path or dataset.get_active_database_path()
+    if not db_path.exists():
+        # Deliberately doesn't include db_path in the message: this bubbles
+        # up to the API's error response, and a server filesystem path must
+        # never reach the frontend (Day 7 security requirement).
         raise QueryExecutionError(
-            f"Database not found at {settings.DATABASE_PATH}. "
-            "Run `python database/build_db.py` first."
+            "The active dataset's database file was not found. "
+            "If this is the built-in Olist dataset, run `python database/build_db.py`."
         )
 
     # mode=ro opens the file read-only at the OS level; SQLite will refuse
     # any write even if our SQL validation somehow missed one.
     conn = sqlite3.connect(
-        f"file:{settings.DATABASE_PATH}?mode=ro",
+        f"file:{db_path}?mode=ro",
         uri=True,
         timeout=settings.QUERY_TIMEOUT_SECONDS,
     )

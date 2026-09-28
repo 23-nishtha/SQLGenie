@@ -29,8 +29,9 @@ SELECT query that answers the question. Rules:
 - Only generate read-only queries: SELECT (optionally with WITH ... SELECT).
   Never generate INSERT, UPDATE, DELETE, DROP, ALTER, or any other
   data-changing or admin statement.
-- Prefer the v_order_items_detail view for questions spanning orders,
-  products, customers or sellers, instead of writing the joins yourself.
+- If the schema below includes "General notes", follow them — they contain
+  dataset-specific guidance (e.g. which columns to avoid, or a convenience
+  view to prefer over writing joins by hand).
 - If the question is ambiguous, make a reasonable assumption rather than
   asking for clarification (you cannot ask follow-up questions).
 

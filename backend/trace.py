@@ -13,6 +13,7 @@ import re
 import time
 
 from backend.config import settings
+from backend.dataset import DatasetSummary
 from backend.models import (
     DbExecutionStep, QuestionStep, ResultStep, SchemaRetrievalStep,
     SelfCorrectionStep, SqlGenerationStep, SqlGuardStep, StepStatus, StepType,
@@ -78,7 +79,10 @@ class TraceRecorder:
             )
         )
 
-    def build(self, *, attempts: int, max_correction_attempts: int, corrected: bool) -> Trace:
+    def build(
+        self, *, attempts: int, max_correction_attempts: int, corrected: bool,
+        dataset: DatasetSummary,
+    ) -> Trace:
         return Trace(
             summary=TraceSummary(
                 attempts=attempts,
@@ -87,4 +91,5 @@ class TraceRecorder:
                 total_duration_ms=elapsed_ms(self._started),
             ),
             steps=list(self._steps),
+            dataset=dataset,
         )

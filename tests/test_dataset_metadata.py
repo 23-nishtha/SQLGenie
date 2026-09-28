@@ -95,16 +95,30 @@ def test_ask_dataset_block_matches_the_dataset_endpoint(client):
 
 
 def test_unknown_dataset_raises_a_clear_error(monkeypatch):
-    monkeypatch.setattr(settings, "SQLGENIE_DATASET", "football")
+    """Day 7: the active dataset is a mutable in-memory pointer (see
+    backend/dataset.py), set from SQLGENIE_DATASET once at import time —
+    not re-read from `settings` on every call, unlike through Day 6. The
+    only way it can ever point at something unregistered is a startup
+    misconfiguration, which this simulates directly on the pointer itself
+    rather than on `settings` (which get_active_dataset() no longer reads).
+    """
+    monkeypatch.setattr(dataset, "_active_dataset_id", "football")
     with pytest.raises(UnknownDatasetError, match="olist"):
         dataset.get_active_dataset()
 
 
 def test_startup_fails_fast_on_an_unknown_dataset(monkeypatch):
-    monkeypatch.setattr(settings, "SQLGENIE_DATASET", "football")
+    monkeypatch.setattr(dataset, "_active_dataset_id", "football")
     with pytest.raises(UnknownDatasetError):
         with TestClient(app):
             pass
+
+
+def test_selecting_an_unknown_dataset_id_is_rejected_not_silently_accepted():
+    """The actual Day 7 way an unknown dataset id gets rejected in normal
+    operation: via set_active_dataset(), not a corrupted env var."""
+    with pytest.raises(UnknownDatasetError, match="football"):
+        dataset.set_active_dataset("football")
 
 
 # ---------------------------------------------------------------------------

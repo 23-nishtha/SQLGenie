@@ -168,9 +168,16 @@ class TraceSummary(BaseModel):
 
 class Trace(BaseModel):
     """Only steps that actually ran appear here; on a failure the list ends
-    at the failing step."""
+    at the failing step.
+
+    Day 7: carries `dataset` directly (not just as a sibling field on the
+    outer response), so a trace stays self-describing — which dataset it
+    ran against — even if it's ever extracted, logged or persisted apart
+    from the rest of the /ask response.
+    """
     summary: TraceSummary
     steps: list[PipelineStep]
+    dataset: DatasetSummary
 
 
 class LlmInfo(BaseModel):

@@ -78,6 +78,14 @@ class Settings:
     # --- Database ---
     DATABASE_PATH: Path = PROJECT_ROOT / os.getenv("DATABASE_PATH", "database/olist.db")
 
+    # --- CSV upload (Day 7) ---
+    # Where converted uploads live: one subfolder per upload, named by a
+    # server-generated id — never the user's filename (see backend/csv_upload.py).
+    UPLOADS_DIR: Path = PROJECT_ROOT / os.getenv("UPLOADS_DIR", "uploads")
+    # 5 MB default: generous for a single CSV table, small enough that the
+    # whole file is read into memory during conversion without a second thought.
+    CSV_UPLOAD_MAX_BYTES: int = _get_int("CSV_UPLOAD_MAX_BYTES", 5 * 1024 * 1024)
+
     # --- Safety limits ---
     MAX_ROWS: int = _get_int("MAX_ROWS", 200)
     QUERY_TIMEOUT_SECONDS: int = _get_int("QUERY_TIMEOUT_SECONDS", 10)

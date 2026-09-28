@@ -7,5 +7,8 @@ openai>=1.30
 python-dotenv>=1.0
 sqlparse>=0.5
 
+# Day 7: CSV dataset upload (multipart/form-data parsing for FastAPI)
+python-multipart>=0.0.9
+
 # Testing
 pytest>=8.0

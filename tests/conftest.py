@@ -18,6 +18,31 @@ customized .env can't make these tests fail.
 """
 import os
 
+import pytest
+
 os.environ.setdefault("SQLGENIE_LLM_MODE", "mock")
 os.environ.setdefault("SQLGENIE_DATASET", "olist")
 os.environ.setdefault("CORS_ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")
+
+
+@pytest.fixture(autouse=True)
+def _reset_dataset_registry():
+    """Day 7: the active dataset and the dataset registry are real, mutable,
+    in-memory server state (backend/dataset.py) — a test that uploads a CSV
+    or switches datasets would otherwise leak that into every test that
+    runs after it. Snapshot both before each test and restore them after,
+    the same way the env vars above are pinned rather than left to chance.
+    """
+    from backend import dataset as dataset_module
+    from backend import schema_retrieval as schema_retrieval_module
+
+    original_active = dataset_module._active_dataset_id
+    original_registry = dict(dataset_module._registry)
+    yield
+    dataset_module._active_dataset_id = original_active
+    dataset_module._registry.clear()
+    dataset_module._registry.update(original_registry)
+    # A test's uploaded/selected dataset may also have left retrieval
+    # caches behind, keyed by a dataset id that no longer exists afterward.
+    schema_retrieval_module._documents_cache.clear()
+    schema_retrieval_module._full_schema_chars_cache.clear()
