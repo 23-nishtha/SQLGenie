@@ -33,13 +33,17 @@ StepType = Literal[
 StepStatus = Literal["success", "failed"]
 
 # Machine-readable failure categories (the HTTP status is separate):
+#   invalid_request       -> 422  the request body itself was malformed (e.g. missing/empty
+#                                  "question") — FastAPI's own validation, before the
+#                                  pipeline ever runs. See main.py's RequestValidationError handler.
 #   unsupported_question -> 400  mock mode doesn't know this question
 #   sql_rejected         -> 422  the SQL guard refused the SQL
 #   execution_failed     -> 500  every attempt (initial + corrections) failed in SQLite
 #   llm_error            -> 502  the LLM call itself failed (missing key, network, quota...)
 #   internal_error       -> 502  anything unexpected outside the LLM call
 ErrorType = Literal[
-    "unsupported_question", "sql_rejected", "execution_failed", "llm_error", "internal_error",
+    "invalid_request", "unsupported_question", "sql_rejected", "execution_failed",
+    "llm_error", "internal_error",
 ]
 
 

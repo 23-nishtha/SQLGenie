@@ -17,7 +17,8 @@ and maps the outcome to HTTP):
 Run it with:  uvicorn backend.main:app --reload
 Then open:    http://127.0.0.1:8000/docs
 """
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -26,6 +27,7 @@ from backend.config import settings
 from backend.dataset import DatasetListResponse, DatasetProfile, DatasetSummary
 from backend.models import (
     AskRequest, AskResponse, ErrorInfo, ErrorResponse, ErrorType, LlmInfo,
+    Trace, TraceSummary,
 )
 from backend.trace import redact_secrets
 
@@ -172,8 +174,10 @@ def debug_retrieve(question: str):
 
 # How each failure category maps to an HTTP status. These are the same codes
 # /ask has used since Day 2 (400 unsupported mock question, 422 guard
-# rejection, 500 exhausted retries, 502 LLM failure).
+# rejection, 500 exhausted retries, 502 LLM failure) plus Day 9's
+# invalid_request, which the handler below always answers with 422 directly.
 _ERROR_STATUS: dict[ErrorType, int] = {
+    "invalid_request": 422,
     "unsupported_question": 400,
     "sql_rejected": 422,
     "execution_failed": 500,
@@ -185,6 +189,55 @@ _ERROR_STATUS: dict[ErrorType, int] = {
 def _llm_info() -> LlmInfo:
     mode = settings.SQLGENIE_LLM_MODE
     return LlmInfo(mode=mode, model=None if mode == "mock" else settings.OPENAI_MODEL)
+
+
+def _empty_trace(dataset_summary: DatasetSummary) -> Trace:
+    """A trace for an error that happened before the pipeline ever ran (a
+    malformed request body) — zero steps, since nothing ran, but still the
+    same Trace shape every other /ask response carries."""
+    return Trace(
+        summary=TraceSummary(
+            attempts=0,
+            max_correction_attempts=agent.MAX_CORRECTION_ATTEMPTS,
+            corrected=False,
+            total_duration_ms=0.0,
+        ),
+        steps=[],
+        dataset=dataset_summary,
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def handle_request_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """Day 9: reshapes FastAPI's OWN built-in validation error — e.g. a
+    missing or empty "question" in the /ask body — into the exact same
+    ErrorResponse envelope every other /ask failure already uses.
+
+    Before this handler existed, a malformed request got FastAPI's default
+    422 body, `{"detail": [ {type, loc, msg, ...}, ... ]}` — an ARRAY —
+    while every other /ask error returned `{"detail": "<string>", "error":
+    {...}, ...}`. Same status code, two incompatible shapes, which forced a
+    frontend to branch on `typeof detail` before it could show anything.
+    This handler is registered app-wide (not just for /ask), so any
+    endpoint's request-validation failure gets the same one consistent
+    shape. HTTP status stays 422 — this only changes the BODY.
+    """
+    # Each FastAPI/Pydantic error has e.g. loc=("body","question"), msg=
+    # "Field required". Turn that into one readable line per error, e.g.
+    # "question: Field required" (dropping the generic leading "body").
+    message = "; ".join(
+        f"{'.'.join(str(part) for part in error['loc'] if part != 'body')}: {error['msg']}"
+        for error in exc.errors()
+    )
+    dataset_summary = dataset.get_active_dataset().summary()
+    body = ErrorResponse(
+        detail=message,
+        error=ErrorInfo(type="invalid_request", failed_step=None, message=message),
+        dataset=dataset_summary,
+        llm=_llm_info(),
+        trace=_empty_trace(dataset_summary),
+    )
+    return JSONResponse(status_code=422, content=body.model_dump(mode="json"))
 
 
 def _error_message(run: agent.PipelineRun) -> str:
