@@ -28,11 +28,15 @@ def _get_int(name: str, default: int) -> int:
         return default
 
 
-# Local dev servers for the future frontend (Vite's default port is 5173).
-# Deliberately NOT "*": a wildcard would let ANY website's JavaScript call
-# this API from a visitor's browser. When the real frontend is deployed, set
+# Local dev servers for the frontend. 5173 is Vite's default port; 8080 is
+# where the Day 9 Lovable frontend actually runs. Deliberately NOT "*": a
+# wildcard would let ANY website's JavaScript call this API from a
+# visitor's browser. When the real frontend is deployed, set
 # CORS_ALLOWED_ORIGINS in .env to its exact origin(s) instead.
-DEFAULT_CORS_ORIGINS = "http://localhost:5173,http://127.0.0.1:5173"
+DEFAULT_CORS_ORIGINS = (
+    "http://localhost:5173,http://127.0.0.1:5173,"
+    "http://localhost:8080,http://127.0.0.1:8080"
+)
 
 
 def _get_list(name: str, default: str) -> list[str]:
@@ -53,6 +57,10 @@ class Settings:
     #             This is the default so the app works out of the box even
     #             without OpenAI credits.
     # "openai" -> the real call in backend/llm.py. Needs OPENAI_API_KEY.
+    # "ollama" -> a local model via Ollama's /api/chat (see OLLAMA_* below).
+    #             No API key, no network call beyond localhost — but needs
+    #             Ollama actually running (`ollama serve`) with the
+    #             configured model pulled (`ollama pull <model>`).
     SQLGENIE_LLM_MODE: str = os.getenv("SQLGENIE_LLM_MODE", "mock").strip().lower()
 
     # --- OpenAI ---
@@ -63,6 +71,20 @@ class Settings:
     # fail with a "model not found" error, change OPENAI_MODEL in your .env
     # to a model your account has access to (e.g. "gpt-4o-mini").
     OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-5.6-luna")
+
+    # --- Ollama (local LLM) ---
+    # Which locally-pulled Ollama model generates the SQL when
+    # SQLGENIE_LLM_MODE=ollama. Only used in that mode.
+    OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "qwen3:4b")
+    # Ollama's own HTTP API, running locally by default. rstrip so
+    # backend/llm.py can safely append "/api/chat" without a double slash.
+    OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
+
+    # Which locally-pulled Ollama model embeds schema/question text for
+    # retrieval (backend/schema_retrieval.py). Always Ollama, regardless of
+    # SQLGENIE_LLM_MODE/OLLAMA_MODEL above — retrieval never calls a cloud
+    # API, even when SQL generation itself uses OpenAI.
+    OLLAMA_EMBED_MODEL: str = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text:latest")
 
     # --- Dataset (Day 6) ---
     # Which entry of backend/dataset.py's registry describes the database

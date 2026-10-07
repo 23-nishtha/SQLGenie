@@ -224,9 +224,9 @@ def test_schema_retrieval_step_reports_tables_and_reasons(client):
 
     tables = {t.name: t for t in retrieval.data.tables}
     assert "order_reviews" in tables
-    assert tables["order_reviews"].selected_by == "score"
+    assert tables["order_reviews"].selected_by == "embedding"
     assert tables["order_reviews"].score > 0
-    assert all(t.selected_by in {"score", "fk_expansion", "fallback"} for t in tables.values())
+    assert all(t.selected_by in {"embedding", "fk_expansion", "fallback"} for t in tables.values())
     assert "order_reviews.order_id -> orders.order_id" in retrieval.data.relationships
     assert 0 < retrieval.data.schema_chars < retrieval.data.full_schema_chars
 

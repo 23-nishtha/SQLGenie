@@ -1,10 +1,16 @@
-"""Tests for Day 3's schema-aware retrieval (backend/schema_retrieval.py).
+"""Tests for schema-aware retrieval (backend/schema_retrieval.py).
 
-These only exercise scoring/selection logic and a read-only SQLite
-connection for column names — no OpenAI call, no network, no API key.
-tests/conftest.py forces SQLGENIE_LLM_MODE=mock for the whole test session,
-but that setting doesn't even matter for these tests: retrieval happens
-before the LLM is ever called.
+These exercise ranking/selection logic and a read-only SQLite connection
+for column names. Retrieval now embeds each table and the question via
+Ollama (backend/llm.embed_text()) — no real network call happens here,
+though: tests/conftest.py's session-scoped `_fake_ollama_embeddings`
+fixture intercepts every /api/embeddings call with a deterministic,
+content-aware fake vector, so these tests need no live Ollama server, no
+API key, and stay fast and reproducible. See tests/test_embedding_retrieval.py
+for tests of the real embedding call's wire format and of caching.
+tests/conftest.py also forces SQLGENIE_LLM_MODE=mock for the whole test
+session, but that setting doesn't matter for these tests either way:
+retrieval happens before the SQL-generation LLM is ever called.
 """
 import pytest
 
@@ -39,21 +45,47 @@ def test_retrieves_expected_tables(question, expected_subset):
 
 
 def test_fk_expansion_does_not_recurse_past_one_hop():
-    """"How many orders were delivered?" only scores on `orders` and
-    `v_order_items_detail` (no other table's name/keywords/columns match).
-    `orders` is directly joined to customers, order_items, order_payments
-    and order_reviews (one hop) — those should all appear. `products` and
-    `sellers` are only reachable by going one hop further, THROUGH
-    order_items (a table that only got in via expansion, not scoring) — a
-    correct one-hop-only implementation must NOT add them, even though an
-    earlier (buggy) version did, because it re-checked membership against
-    the growing result list instead of the frozen original selection."""
-    retrieved = set(retrieve_relevant_tables("How many orders were delivered?"))
+    """FK expansion must only add a table DIRECTLY joined to one that was
+    actually ranked/selected — never a table reachable by going one hop
+    further, through a table that itself only got in via expansion (that
+    would be two hops, not one). This is the one-hop-only contract
+    backend/schema_retrieval._expand_with_join_neighbors() guarantees
+    regardless of what ranked the original selection (embedding similarity
+    now, keyword overlap before): `original` is frozen before expansion
+    starts, so only tables directly joined to an ORIGINALLY selected table
+    can ever be added.
 
-    assert {"orders", "v_order_items_detail"}.issubset(retrieved)
-    assert {"customers", "order_items", "order_payments", "order_reviews"}.issubset(retrieved)
-    assert "products" not in retrieved, "products is 2 hops away (via order_items) — should not be pulled in"
-    assert "sellers" not in retrieved, "sellers is 2 hops away (via order_items) — should not be pulled in"
+    Rather than pin this to one question's exact top-K (which depends on
+    the embedding model's ranking, not on the mechanism being tested), this
+    directly selects a table and checks what one-hop expansion adds from
+    it — exercising the real relationship graph (backend/schema_profiles.
+    OLIST_SCHEMA_PROFILE) a question never could alone.
+    """
+    from backend.schema_profiles import OLIST_SCHEMA_PROFILE
+    from backend.schema_retrieval import _expand_with_join_neighbors
+
+    # orders.customer_id -> customers, and three tables link TO orders:
+    # order_items, order_payments, order_reviews. All four are one hop from
+    # orders; products and sellers are only reachable via a SECOND hop,
+    # through order_items — which, starting from ["orders"] alone, is never
+    # itself an originally-selected table.
+    expanded = set(_expand_with_join_neighbors(
+        ["orders"], OLIST_SCHEMA_PROFILE.relationships, cap=10
+    ))
+
+    assert {"orders", "customers", "order_items", "order_payments", "order_reviews"}.issubset(expanded)
+    assert "products" not in expanded, "products is 2 hops away (via order_items) — should not be pulled in"
+    assert "sellers" not in expanded, "sellers is 2 hops away (via order_items) — should not be pulled in"
+
+
+def test_a_real_question_about_orders_also_gets_orders_and_a_join_partner():
+    """End-to-end sanity check (through the public retrieval function, not
+    just the expansion helper above): a question clearly about orders
+    retrieves `orders` itself plus at least one of its real join partners,
+    regardless of which other tables the embedding model also ranks highly."""
+    retrieved = set(retrieve_relevant_tables("How many orders were delivered?"))
+    assert "orders" in retrieved
+    assert retrieved & {"customers", "order_items", "order_payments", "order_reviews"}
 
 
 def test_retrieval_stays_small():

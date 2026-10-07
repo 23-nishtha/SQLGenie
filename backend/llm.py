@@ -1,5 +1,6 @@
-"""Turns a question into SQL, using either the real OpenAI model or the
-free local mock (see backend/mock_llm.py), depending on SQLGENIE_LLM_MODE.
+"""Turns a question into SQL, using the free local mock (see
+backend/mock_llm.py), the real OpenAI API, or a local Ollama model,
+depending on SQLGENIE_LLM_MODE.
 
 Keeping the API call in one place means: (1) it's easy to test/mock later,
 (2) swapping providers or models later only touches this file.
@@ -10,8 +11,16 @@ database. It's a separate function (not a flag on generate_sql) because the
 prompt is genuinely different: generate_sql only ever sees the question and
 the schema, while correct_sql also needs to show the LLM what it tried
 before and exactly how that failed.
+
+All three modes (mock/openai/ollama) share the SAME SYSTEM_PROMPT_TEMPLATE
+and CORRECTION_USER_TEMPLATE below — only HOW the prompt gets to a model
+(or a lookup table, for mock) differs. That's deliberate: switching modes
+should never change what the model is asked to do, only which model answers.
 """
+import json
 import re
+import urllib.error
+import urllib.request
 
 from openai import OpenAI
 
@@ -67,25 +76,31 @@ def _clean_sql_response(raw_text: str) -> str:
     return text
 
 
+def _unknown_mode_error() -> RuntimeError:
+    return RuntimeError(
+        f"Unknown SQLGENIE_LLM_MODE '{settings.SQLGENIE_LLM_MODE}'. "
+        "Expected 'mock', 'openai' or 'ollama' in .env."
+    )
+
+
 def generate_sql(question: str, schema_text: str) -> str:
     """Turn `question` into one SQL query. This is the only function the
-    rest of the app calls — it decides mock vs. real OpenAI internally,
-    based on settings.SQLGENIE_LLM_MODE, so callers never need to care.
+    rest of the app calls — it decides mock vs. OpenAI vs. Ollama
+    internally, based on settings.SQLGENIE_LLM_MODE, so callers never need
+    to care which one actually runs.
 
     Returns the raw SQL text. It is NOT validated here — sql_guard.py does
     that before anything executes it.
     """
-    if settings.SQLGENIE_LLM_MODE == "mock":
+    mode = settings.SQLGENIE_LLM_MODE
+    if mode == "mock":
         # No network call, no API key needed — see mock_llm.py for why.
         return generate_sql_mock(question)
-
-    if settings.SQLGENIE_LLM_MODE != "openai":
-        raise RuntimeError(
-            f"Unknown SQLGENIE_LLM_MODE '{settings.SQLGENIE_LLM_MODE}'. "
-            "Expected 'mock' or 'openai' in .env."
-        )
-
-    return _generate_sql_openai(question, schema_text)
+    if mode == "openai":
+        return _generate_sql_openai(question, schema_text)
+    if mode == "ollama":
+        return _generate_sql_ollama(question, schema_text)
+    raise _unknown_mode_error()
 
 
 def correct_sql(
@@ -104,16 +119,14 @@ def correct_sql(
     since it gets shown to the LLM verbatim and, on total failure, may end
     up in the API's error response too.
     """
-    if settings.SQLGENIE_LLM_MODE == "mock":
+    mode = settings.SQLGENIE_LLM_MODE
+    if mode == "mock":
         return correct_sql_mock(question, attempt_number)
-
-    if settings.SQLGENIE_LLM_MODE != "openai":
-        raise RuntimeError(
-            f"Unknown SQLGENIE_LLM_MODE '{settings.SQLGENIE_LLM_MODE}'. "
-            "Expected 'mock' or 'openai' in .env."
-        )
-
-    return _correct_sql_openai(question, schema_text, failed_sql, db_error)
+    if mode == "openai":
+        return _correct_sql_openai(question, schema_text, failed_sql, db_error)
+    if mode == "ollama":
+        return _correct_sql_ollama(question, schema_text, failed_sql, db_error)
+    raise _unknown_mode_error()
 
 
 def _call_openai(system_content: str, user_content: str) -> str:
@@ -150,3 +163,155 @@ def _correct_sql_openai(question: str, schema_text: str, failed_sql: str, db_err
         question=question, failed_sql=failed_sql, db_error=db_error
     )
     return _call_openai(SYSTEM_PROMPT_TEMPLATE.format(schema=schema_text), user_content)
+
+
+# ---------------------------------------------------------------------------
+# Ollama (local model). Uses stdlib urllib only — no extra dependency just
+# for one HTTP call, and it keeps this third mode as easy to read/test as
+# the two above it.
+# ---------------------------------------------------------------------------
+
+_OLLAMA_CHAT_PATH = "/api/chat"
+# Local models can be slow, especially on the very first call after the
+# server starts (loading the model into memory) — a generous timeout
+# avoids a spurious "connection" error that's actually just a cold start.
+_OLLAMA_TIMEOUT_SECONDS = 120
+
+
+def _call_ollama(system_content: str, user_content: str) -> str:
+    """Shared by _generate_sql_ollama and _correct_sql_ollama: POST to
+    Ollama's /api/chat with the same system+user shape _call_openai uses,
+    return the cleaned SQL text.
+
+    "stream": false — we want one complete response, not a token stream
+    (this app isn't built to consume one).
+    "think": false — Qwen3 (and other reasoning-capable Ollama models) can
+    emit a <think>...</think> reasoning block before its answer; we only
+    want the final SQL, so this is turned off at the request level rather
+    than having _clean_sql_response() try to strip it out after the fact.
+    """
+    url = f"{settings.OLLAMA_BASE_URL}{_OLLAMA_CHAT_PATH}"
+    payload = {
+        "model": settings.OLLAMA_MODEL,
+        "messages": [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": user_content},
+        ],
+        "stream": False,
+        "think": False,
+    }
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=_OLLAMA_TIMEOUT_SECONDS) as response:
+            raw_body = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        # Ollama answers a missing/unpulled model with an HTTP error whose
+        # body names it, e.g. {"error": "model \"qwen3:4b\" not found, try
+        # pulling it first"}. Surface that, plus the model we asked for.
+        error_text = exc.read().decode("utf-8", errors="replace")
+        try:
+            error_text = json.loads(error_text).get("error", error_text)
+        except (json.JSONDecodeError, AttributeError):
+            pass
+        raise RuntimeError(
+            f"Ollama returned an error for model '{settings.OLLAMA_MODEL}': {error_text}. "
+            f"If it isn't pulled yet, run: ollama pull {settings.OLLAMA_MODEL}"
+        ) from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        # Covers connection-refused (Ollama not running), DNS failure, and
+        # a read/connect timeout alike — from the caller's point of view
+        # all of these mean the same thing: couldn't talk to Ollama.
+        raise RuntimeError(
+            f"Could not connect to Ollama at {settings.OLLAMA_BASE_URL}. "
+            "Make sure Ollama is running."
+        ) from exc
+
+    try:
+        body = json.loads(raw_body)
+        raw_text = body["message"]["content"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise RuntimeError(
+            f"Unexpected response from Ollama (model '{settings.OLLAMA_MODEL}'): "
+            f"could not find a message in {raw_body[:200]!r}"
+        ) from exc
+
+    return _clean_sql_response(raw_text)
+
+
+def _generate_sql_ollama(question: str, schema_text: str) -> str:
+    """The local Ollama call. Only used when SQLGENIE_LLM_MODE=ollama."""
+    return _call_ollama(SYSTEM_PROMPT_TEMPLATE.format(schema=schema_text), question)
+
+
+# ---------------------------------------------------------------------------
+# Embeddings, for backend/schema_retrieval.py's embedding-based retrieval.
+#
+# Unlike generate_sql()/correct_sql() above, this has no mock/openai/ollama
+# dispatch: retrieval always embeds locally via Ollama's OLLAMA_EMBED_MODEL,
+# regardless of SQLGENIE_LLM_MODE — even when that setting is "openai" (SQL
+# generation uses the cloud, retrieval still doesn't) or "mock" (tests fake
+# this call out; see tests/conftest.py).
+# ---------------------------------------------------------------------------
+
+_OLLAMA_EMBEDDINGS_PATH = "/api/embeddings"
+
+
+def embed_text(text: str) -> list[float]:
+    """Return OLLAMA_EMBED_MODEL's embedding vector for `text`, via Ollama's
+    local /api/embeddings endpoint. Raises RuntimeError with a readable
+    message on any failure (Ollama not running, model not pulled, a bad
+    response) — same error-handling shape as _call_ollama above, just
+    against a different endpoint and response shape (`{"embedding": [...]}`
+    instead of `{"message": {"content": ...}}`).
+    """
+    url = f"{settings.OLLAMA_BASE_URL}{_OLLAMA_EMBEDDINGS_PATH}"
+    payload = {"model": settings.OLLAMA_EMBED_MODEL, "prompt": text}
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=_OLLAMA_TIMEOUT_SECONDS) as response:
+            raw_body = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        error_text = exc.read().decode("utf-8", errors="replace")
+        try:
+            error_text = json.loads(error_text).get("error", error_text)
+        except (json.JSONDecodeError, AttributeError):
+            pass
+        raise RuntimeError(
+            f"Ollama returned an error for embedding model '{settings.OLLAMA_EMBED_MODEL}': {error_text}. "
+            f"If it isn't pulled yet, run: ollama pull {settings.OLLAMA_EMBED_MODEL}"
+        ) from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError(
+            f"Could not connect to Ollama at {settings.OLLAMA_BASE_URL} for embeddings. "
+            "Make sure Ollama is running."
+        ) from exc
+
+    try:
+        body = json.loads(raw_body)
+        embedding = body["embedding"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise RuntimeError(
+            f"Unexpected response from Ollama embeddings (model '{settings.OLLAMA_EMBED_MODEL}'): "
+            f"could not find an embedding in {raw_body[:200]!r}"
+        ) from exc
+    return embedding
+
+
+def _correct_sql_ollama(question: str, schema_text: str, failed_sql: str, db_error: str) -> str:
+    """The local Ollama correction call. Only used when SQLGENIE_LLM_MODE=ollama."""
+    user_content = CORRECTION_USER_TEMPLATE.format(
+        question=question, failed_sql=failed_sql, db_error=db_error
+    )
+    return _call_ollama(SYSTEM_PROMPT_TEMPLATE.format(schema=schema_text), user_content)

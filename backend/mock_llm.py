@@ -73,6 +73,13 @@ _MOCK_ANSWERS: dict[str, str] = {
     # lookup table. Picking a question here while the WRONG dataset is
     # active fails at execution (no such table), exactly like it would for
     # a real LLM asked to write SQL against a schema it wasn't shown.
+    # "winner" only ever holds the literal text 'home'/'away'/'draw' — NEVER
+    # a team name. Every mock answer below that's about an actual TEAM
+    # (as opposed to "home wins"/"away wins") derives the team name from
+    # home_team/away_team, filtered or paired via winner — it never groups
+    # by or compares winner to a team name directly. See the matching
+    # warning in schema_profiles.py's FOOTBALL_SCHEMA_PROFILE, which exists
+    # so a real LLM makes the same choice these canned answers do.
     "which team has the most wins": (
         "SELECT team, COUNT(*) AS wins FROM ("
         "  SELECT home_team AS team FROM results WHERE winner = 'home'"
@@ -80,6 +87,39 @@ _MOCK_ANSWERS: dict[str, str] = {
         "  SELECT away_team AS team FROM results WHERE winner = 'away'"
         ") GROUP BY team ORDER BY wins DESC LIMIT 1"
     ),
+    "which team has the most losses": (
+        "SELECT team, COUNT(*) AS losses FROM ("
+        "  SELECT away_team AS team FROM results WHERE winner = 'home'"
+        "  UNION ALL"
+        "  SELECT home_team AS team FROM results WHERE winner = 'away'"
+        ") GROUP BY team ORDER BY losses DESC LIMIT 1"
+    ),
+    "how many matches has brazil won": (
+        "SELECT COUNT(*) AS brazil_wins FROM results "
+        "WHERE (home_team = 'Brazil' AND winner = 'home') "
+        "OR (away_team = 'Brazil' AND winner = 'away')"
+    ),
+    "how many matches has brazil lost": (
+        "SELECT COUNT(*) AS brazil_losses FROM results "
+        "WHERE (home_team = 'Brazil' AND winner = 'away') "
+        "OR (away_team = 'Brazil' AND winner = 'home')"
+    ),
+    "which team has scored the most goals": (
+        "SELECT team, SUM(goals) AS goals_scored FROM ("
+        "  SELECT home_team AS team, home_score AS goals FROM results"
+        "  UNION ALL"
+        "  SELECT away_team AS team, away_score AS goals FROM results"
+        ") GROUP BY team ORDER BY goals_scored DESC LIMIT 1"
+    ),
+    "which team has conceded the most goals": (
+        "SELECT team, SUM(conceded) AS goals_conceded FROM ("
+        "  SELECT home_team AS team, away_score AS conceded FROM results"
+        "  UNION ALL"
+        "  SELECT away_team AS team, home_score AS conceded FROM results"
+        ") GROUP BY team ORDER BY goals_conceded DESC LIMIT 1"
+    ),
+    "how many home wins were there": "SELECT COUNT(*) AS home_wins FROM results WHERE winner = 'home'",
+    "how many away wins were there": "SELECT COUNT(*) AS away_wins FROM results WHERE winner = 'away'",
     "how many matches are there": "SELECT COUNT(*) AS total_matches FROM results",
     "what is the highest goal difference in a match": (
         "SELECT MAX(goal_diff) AS highest_goal_diff FROM results"

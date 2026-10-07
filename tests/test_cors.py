@@ -15,7 +15,20 @@ from backend import config
 from backend.config import DEFAULT_CORS_ORIGINS, settings
 from backend.main import app
 
+# tests/conftest.py pins CORS_ALLOWED_ORIGINS to just these two (the
+# original Vite dev origins), independent of whatever backend/config.py's
+# DEFAULT_CORS_ORIGINS constant contains — that's what keeps these
+# request-level tests deterministic regardless of the code's default.
 ALLOWED_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]
+
+# What DEFAULT_CORS_ORIGINS itself should contain — checked separately,
+# below, against the actual constant rather than the pinned test value.
+# Updated when the Day 9 Lovable frontend's port (8080) was added.
+DEFAULT_ORIGINS = [
+    "http://localhost:5173", "http://127.0.0.1:5173",
+    "http://localhost:8080", "http://127.0.0.1:8080",
+]
+
 DISALLOWED_ORIGIN = "http://evil.example.com"
 
 
@@ -43,8 +56,20 @@ def preflight(client, origin):
 
 
 def test_default_origins_are_the_local_dev_origins_and_not_a_wildcard():
-    assert DEFAULT_CORS_ORIGINS.split(",") == ALLOWED_ORIGINS
+    assert DEFAULT_CORS_ORIGINS.split(",") == DEFAULT_ORIGINS
     assert "*" not in DEFAULT_CORS_ORIGINS
+
+
+def test_default_includes_the_lovable_frontend_port_8080():
+    """Regression test: the Day 9 Lovable frontend runs on 8080, not Vite's
+    5173, and was initially getting CORS-blocked because the default only
+    listed 5173."""
+    origins = DEFAULT_CORS_ORIGINS.split(",")
+    assert "http://localhost:8080" in origins
+    assert "http://127.0.0.1:8080" in origins
+    # The original 5173 origins must still be present too.
+    assert "http://localhost:5173" in origins
+    assert "http://127.0.0.1:5173" in origins
 
 
 def test_settings_use_the_configured_origins():
@@ -65,12 +90,12 @@ def test_origins_are_configurable_from_the_environment(monkeypatch):
 @pytest.mark.parametrize("blank", ["", "   "])
 def test_blank_setting_falls_back_to_the_safe_default(monkeypatch, blank):
     monkeypatch.setenv("CORS_ALLOWED_ORIGINS", blank)
-    assert config._get_list("CORS_ALLOWED_ORIGINS", DEFAULT_CORS_ORIGINS) == ALLOWED_ORIGINS
+    assert config._get_list("CORS_ALLOWED_ORIGINS", DEFAULT_CORS_ORIGINS) == DEFAULT_ORIGINS
 
 
 def test_unset_setting_falls_back_to_the_safe_default(monkeypatch):
     monkeypatch.delenv("CORS_ALLOWED_ORIGINS", raising=False)
-    assert config._get_list("CORS_ALLOWED_ORIGINS", DEFAULT_CORS_ORIGINS) == ALLOWED_ORIGINS
+    assert config._get_list("CORS_ALLOWED_ORIGINS", DEFAULT_CORS_ORIGINS) == DEFAULT_ORIGINS
 
 
 def test_middleware_is_registered_with_the_configured_origins_and_no_credentials():

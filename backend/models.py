@@ -58,11 +58,12 @@ class QuestionData(BaseModel):
 class RetrievedTable(BaseModel):
     name: str
     kind: Literal["table", "view"]
-    # Why this table was included: it scored well against the question, it
-    # is a direct foreign-key neighbor of one that did, or nothing matched
-    # at all and the hub table `orders` was used as the fallback.
-    selected_by: Literal["score", "fk_expansion", "fallback"]
-    score: int
+    # Why this table was included: it ranked highly by embedding cosine
+    # similarity to the question, it is a direct foreign-key neighbor of
+    # one that did, or nothing matched confidently enough and the hub table
+    # `orders` was used as the fallback.
+    selected_by: Literal["embedding", "fk_expansion", "fallback"]
+    score: float  # cosine similarity (0 for fk_expansion/fallback-only tables)
 
 
 class SchemaRetrievalData(BaseModel):
