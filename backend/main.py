@@ -73,7 +73,15 @@ def health_check():
         "database_path": str(settings.DATABASE_PATH),
         "database_found": settings.DATABASE_PATH.exists(),
         "llm_mode": settings.SQLGENIE_LLM_MODE,
-        "model": settings.OPENAI_MODEL,
+        "model": (
+            None
+            if settings.SQLGENIE_LLM_MODE == "mock"
+            else (
+                settings.OLLAMA_MODEL
+                if settings.SQLGENIE_LLM_MODE == "ollama"
+                else settings.OPENAI_MODEL
+            )
+        ),
     }
 
 
