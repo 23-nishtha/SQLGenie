@@ -190,11 +190,16 @@ SQLGenie/
 │   ├── models.py             # Pydantic request/response/trace schemas
 │   └── config.py             # Environment-driven settings
 ├── database/
-│   ├── football/, movies/    # Build scripts + schema for the built-in datasets
-│   └── raw/                   # Raw source CSVs for the Olist dataset
-├── tests/                     # pytest suite (254 tests)
-├── uploads/                    # Runtime storage for uploaded CSV-derived SQLite files (git-ignored)
+│   ├── football/football.db, movies/movies.db  # Committed directly (small)
+│   ├── olist.db.sha256      # Committed checksum; olist.db itself is NOT committed — see §13
+│   └── raw/                   # Raw source CSVs for the Olist dataset (git-ignored)
+├── scripts/
+│   └── fetch_olist_db.py    # Render build-time step: downloads + SHA-256-verifies olist.db
+├── tests/                     # pytest suite
+├── uploads/                    # Runtime storage for uploaded CSV-derived SQLite files (git-ignored, EPHEMERAL on Render)
 ├── requirements.txt
+├── render.yaml               # Render Blueprint (optional — see §13.7 for the manual equivalent)
+├── .python-version           # Pins Python 3.13 for Render
 ├── .env.example
 └── README.md
 ```
@@ -281,7 +286,130 @@ No frontend test suite exists in this repository.
 
 ---
 
-## 13. Example Questions
+## 13. Deploying the Backend to Render
+
+This section covers the **backend only** (a Render free web service). The frontend deploys separately to Vercel — see `SQLGenie-Frontend`'s own repo; nothing here touches it.
+
+### 13.1 Files involved
+
+| File | Purpose |
+|---|---|
+| `render.yaml` | A Blueprint: declares the service, build/start commands, health check, and every environment variable (secrets marked `sync: false` — never stored in the file). Optional — see §13.7 for the manual-dashboard equivalent. |
+| `.python-version` | Pins the Python version to `3.13`, matching local development. |
+| `scripts/fetch_olist_db.py` | Downloads and SHA-256-verifies `database/olist.db` at build time (see §13.6). |
+| `database/olist.db.sha256` | The Olist database's expected checksum, committed to git so the verification itself is reviewable. |
+| `.env.example` | Every environment variable this app reads, documented — never real secrets. |
+
+### 13.2 Production startup command
+
+```
+uvicorn backend.main:app --host 0.0.0.0 --port ${PORT:-10000} --proxy-headers --forwarded-allow-ips 127.0.0.1
+```
+
+Already set as `startCommand` in `render.yaml`. Breaking it down:
+- **No `--reload`** — that's a development-only flag (auto-restarts on file changes); it must never run in production.
+- **`--host 0.0.0.0`** — Render's proxy connects over the network, not loopback, so binding only to `127.0.0.1` (uvicorn's own default) would make the app unreachable.
+- **`--port ${PORT:-10000}`** — Render's documented default web-service port is `10000`; this reads a `PORT` env var if one is set, and falls back to `10000` if not, so it works either way.
+- **`--forwarded-allow-ips 127.0.0.1`** — see §13.12. This is not optional; leaving it out creates a real, verified weakness.
+
+### 13.3 Dependencies
+
+`requirements.txt` already includes everything needed: `fastapi`, `uvicorn[standard]`, `google-genai`, `openai`, `python-dotenv`, `sqlparse`, `python-multipart`, `pandas`, `pytest`. No changes were needed here for deployment — only the Gemini SDK was added earlier (Stage 1).
+
+### 13.4 Environment variables (set in Render's dashboard, never committed)
+
+Every variable `backend/config.py` reads is documented in `.env.example`. The ones that matter most for a Render deployment, and must be set through Render's **Environment** tab (or prompted once via Blueprint — see §13.7) rather than hardcoded anywhere:
+
+| Variable | Set to | Why |
+|---|---|---|
+| `SQLGENIE_LLM_MODE` | `gemini` | Enables Gemini SQL generation/correction/embeddings |
+| `GEMINI_API_KEY` | *(your real key)* | **Secret.** Never in git, never in `render.yaml` — paste directly into the dashboard |
+| `GEMINI_MODEL` | `gemini-3.6-flash` | Verified against Google's current model list (Stage 1) |
+| `GEMINI_EMBED_MODEL` | `gemini-embedding-001` | Same |
+| `CORS_ALLOWED_ORIGINS` | your deployed Vercel URL, e.g. `https://your-app.vercel.app` | Never `*` — see `backend/main.py`'s CORS setup |
+| `TRUST_PROXY_HEADERS` | `true` | **Required for correct rate limiting on Render** — see §13.12 |
+| `ENABLE_DEBUG_ENDPOINTS` | `false` (or just leave unset — it defaults to `false`) | See §13.10 |
+| `OLIST_DB_URL` | the Olist `.db` Release asset's download URL | See §13.6 — only needed at build time |
+| `DATABASE_PATH`, `UPLOADS_DIR`, `MAX_ROWS`, `QUERY_TIMEOUT_SECONDS`, `MAX_QUESTION_LENGTH`, `RATE_LIMIT_*` | the defaults already shown in `.env.example` | Already sensible defaults; override only if real traffic needs it |
+
+### 13.5 Gemini mode
+
+Fully configured through the four variables above — no code change is needed to switch providers. `SQLGENIE_LLM_MODE=mock`/`openai`/`ollama` still work exactly as before (Stage 1 added Gemini alongside them, never in place of them).
+
+### 13.6 Olist database delivery (GitHub Release asset + SHA-256 verification)
+
+`database/olist.db` is ~183 MB — GitHub hard-blocks any file over 100 MB pushed without Git LFS, which this project deliberately avoids (per your own instruction). Instead:
+
+1. **You create a GitHub Release** on this repo (I haven't, and won't, push or create anything) and upload `database/olist.db` as a Release asset.
+2. Copy that asset's direct download URL and set it as `OLIST_DB_URL` in Render's dashboard.
+3. Render's build command (`pip install -r requirements.txt && python scripts/fetch_olist_db.py`) downloads it and verifies its SHA-256 against the checksum already committed in `database/olist.db.sha256`:
+   ```
+   32323719515c830bfc6b5d41cc24cb54ad072853162a168f3ffa2384d6c360a0  olist.db
+   ```
+   This is the real checksum of your current local `database/olist.db`, computed and verified during this stage (not guessed).
+4. **The build fails loudly** — non-zero exit, clear message — if `OLIST_DB_URL` is unset, the download fails, or the checksum doesn't match. This app will never silently start up with a missing or corrupted Olist database.
+
+I tested all four code paths of `scripts/fetch_olist_db.py` directly (missing file + no URL, checksum mismatch, successful download, and "already valid, skip re-download") against an isolated sandbox copy — not your real `database/olist.db`, which I verified is still byte-identical afterward.
+
+Locally, this script is a no-op: your `database/olist.db` already exists and already matches the checksum, so `database/build_db.py`'s normal local workflow is completely unaffected.
+
+### 13.7 Manual dashboard setup (if you skip the Blueprint)
+
+If you'd rather not use `render.yaml`: create a new Web Service pointing at this repo, set **Build Command** and **Start Command** to the two commands in §13.2/13.3's build line, set **Health Check Path** to `/health`, and add every variable from §13.4 under **Environment**.
+
+### 13.8 Football and IMDb (Movies) databases
+
+Both are small enough to commit directly (`football.db` ≈ 9 MB, `movies.db` ≈ 556 KB) — no download step needed, unlike Olist. `.gitignore`'s blanket `*.db` rule now carves out explicit exceptions for exactly these two files:
+```
+!database/football/football.db
+!database/movies/movies.db
+```
+`database/olist.db` remains gitignored even with this change — only these two specific files are affected. **I have not run `git add`/`git commit` for them** — per your instructions, that's a step for you to run explicitly:
+```powershell
+git add database/football/football.db database/movies/movies.db
+```
+
+### 13.9 Database paths and uploaded-CSV storage on Render's filesystem
+
+- `DATABASE_PATH` (built-in datasets) and `UPLOADS_DIR` (CSV uploads) are both already configurable via environment variables (`backend/config.py`) — no code change was needed.
+- **Render's free-tier filesystem is ephemeral.** Anything written at runtime — every CSV upload converted via `POST /datasets/upload` — is lost on every restart and every redeploy. Built-in datasets (Olist/Football/Movies) survive because they're placed there by the *build* step (§13.6, §13.8), not written at runtime.
+- This is a genuine limitation, not a bug to fix: a CSV uploaded by one visitor will not survive the service spinning down from inactivity (see §13.11) or a redeploy. Documenting this clearly (here, and in the frontend-facing copy if relevant) is the agreed approach — no S3/R2/persistent-disk integration was added, matching your original scope.
+
+### 13.10 Debug endpoints stay off
+
+`ENABLE_DEBUG_ENDPOINTS` defaults to `false` in every environment (Stage 2.1) — `render.yaml` sets it explicitly to `false` as well, so a Blueprint deploy can't accidentally leave it unset in a way that surprises anyone. `GET /debug/retrieve` 404s (not 403 — it reveals nothing) unless this is deliberately flipped on, which it should never be on a public deployment: it calls the same embedding model `/ask` does, as a real Gemini API call, with no auth.
+
+### 13.11 Free-tier limitations (documented, not engineered around)
+
+- **Sleep / cold start:** Render's free web services spin down after 15 minutes with no inbound traffic, and the next request takes roughly a minute while the instance restarts. The first request a recruiter makes after the demo has been idle will be slow — this is expected, not a bug.
+- **Gemini embedding warm-up, on every process start:** in `gemini` mode, FastAPI's startup hook (`schema_retrieval.init_documents()`) re-embeds every table of the active dataset's schema — and it does this on **every** process start, not just the first-ever deploy, because the embedding cache lives only in that process's memory and is never persisted across restarts. Measured directly in this project's own local smoke test, warming up the Olist dataset (10 tables) took approximately **15–20 seconds**. Combined with the sleep/cold-start behavior above, a visitor hitting the demo right after it's been idle can expect roughly **60–90 seconds** before the first response of any kind — Render's own ~1-minute spin-up, extended by this warm-up (which runs inside that same window, since Render's health check can't pass until the startup hook finishes, so the two delays overlap rather than simply stacking). Because nothing is cached across restarts, **every** wake-from-sleep repeats this embedding work and spends real Gemini API quota reproducing output identical to the previous run — on a free tier with intermittent demo traffic, this can add up over a day of sporadic visits even though no visitor asked a single question.
+- **Ephemeral runtime storage:** see §13.9 — uploaded CSV datasets never persist across a restart or redeploy.
+- **Single instance, single worker — required, not just assumed:** `backend/rate_limit.py`'s limiters hold their state in this one process's memory. Running more than one worker (`uvicorn --workers N>1`) or scaling to more than one Render instance would give each worker/instance its own independent counters, silently multiplying every configured rate limit by the worker/instance count. The startup command in §13.2 does not set `--workers`, and Render's free plan is single-instance by default — this matches that assumption, but it's worth stating as a hard requirement, not an incidental fact: do not add `--workers` to the start command without also replacing the in-memory limiter with a shared store.
+
+### 13.12 Proxy-header configuration and post-deployment IP verification
+
+This is the part of the whole deployment I'd flag as most important to get right, and the one place I want to be explicit about what's **verified from primary sources** versus what still needs confirming against the real deployment.
+
+**What's verified, from Render's own current docs and uvicorn's own source (not community reports):**
+- Render automatically sets `FORWARDED_ALLOW_IPS=*` for every Python service (confirmed from `render.com/docs/environment-variables`).
+- uvicorn's `--proxy-headers` is **on by default**, and when `forwarded_allow_ips` resolves to `*` (which it would, picking up Render's own env var, if left unset on the command line), uvicorn's `ProxyHeadersMiddleware` trusts the **first** entry of `X-Forwarded-For` — the one a client can set themselves — to rewrite `request.client.host` (confirmed by reading `uvicorn.middleware.proxy_headers`'s installed source directly).
+- Combined, those two facts mean: deploying with uvicorn's defaults on Render would make `request.client.host` silently trust an arbitrary, client-spoofable header — exactly the risk this app's own `TRUST_PROXY_HEADERS` setting was built to avoid, just introduced one layer down, by the ASGI server instead of this app's code.
+- The fix is the `--forwarded-allow-ips 127.0.0.1` flag already in §13.2's start command — an explicit CLI flag overrides the environment variable (confirmed from uvicorn's `Config` source), restoring the safe loopback-only default regardless of what Render sets.
+
+**What is still NOT verified, and must be checked against the real deployment, not assumed:**
+- Whether Render's reverse proxy appends to (rather than replaces) a client-supplied `X-Forwarded-For`, and whether the *last* entry is reliably the one the proxy itself added. The reasoning in `backend/rate_limit.py`'s `get_client_ip()` is based on community-support reports, not Render's primary documentation — I was unable to find an authoritative page confirming this behavior, and I'm not presenting it as verified.
+
+**How to verify it after deploying, without logging or exposing any real IP address:**
+1. Set `TRUST_PROXY_HEADERS=true` (already in `render.yaml`).
+2. From one real network (e.g. home Wi-Fi), send `/ask` requests until you get a `429`.
+3. Immediately, from a genuinely different real network (phone on cellular data, a friend's connection, a VPN exit node), send one `/ask` request.
+4. **If `200`:** the resolution correctly distinguishes real visitors — the assumption holds for this deployment. **If `429`:** every visitor is sharing one bucket, meaning either `TRUST_PROXY_HEADERS` isn't taking effect or Render's `X-Forwarded-For` doesn't behave the way `get_client_ip()` assumes — stop and re-investigate before trusting the rate limiter for anything beyond "the whole app has one shared budget."
+
+This test only ever produces HTTP status codes — no IP address is written to a log, displayed, or recorded anywhere to run it.
+
+---
+
+## 14. Example Questions
 
 **Football** (built-in dataset)
 
@@ -308,7 +436,7 @@ No frontend test suite exists in this repository.
 
 ---
 
-## 14. Resume-ready project description
+## 15. Resume-ready project description
 
 - Built an end-to-end Text-to-SQL analytics agent that converts natural-language questions into validated, executed SQL using a locally-hosted Qwen3 4B Instruct model via Ollama — no cloud LLM dependency.
 - Designed and implemented an embedding-based RAG pipeline over database schema metadata (nomic-embed-text embeddings, cosine-similarity ranking, one-hop foreign-key expansion, in-memory caching) to keep LLM context small and accurate across multiple heterogeneous datasets.
@@ -316,7 +444,7 @@ No frontend test suite exists in this repository.
 
 ---
 
-## 15. Future Scope
+## 16. Future Scope
 
 > Future improvements — not currently implemented.
 
@@ -328,6 +456,6 @@ No frontend test suite exists in this repository.
 
 ---
 
-## 16. License
+## 17. License
 
 No license file currently exists in this repository. A license can be added later.

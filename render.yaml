@@ -1,0 +1,93 @@
+# Render Blueprint for SQLGenie's backend ONLY — the frontend (a separate
+# repo, SQLGenie-Frontend) is deployed to Vercel, not Render; nothing here
+# affects it. See README.md's deployment section for the full walkthrough,
+# including manual-dashboard-equivalent steps if you'd rather not use a
+# Blueprint deploy at all.
+#
+# Fields verified against Render's current Blueprint spec
+# (https://render.com/docs/blueprint-spec) and Python-version docs
+# (https://render.com/docs/python-version) rather than guessed — in
+# particular, `runtime:` (not the deprecated `env:`) and `sync: false` for
+# values that must be filled in manually and are never stored here.
+#
+# Variables marked `sync: false` below are NOT secrets by necessity — some
+# (OLIST_DB_URL, CORS_ALLOWED_ORIGINS) simply aren't known until you've
+# created the GitHub Release / deployed the frontend. Render prompts for
+# every `sync: false` value once, at Blueprint creation, then lets you
+# manage it from the dashboard afterward — see the comment on each one.
+services:
+  - type: web
+    name: sqlgenie-backend
+    runtime: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt && python scripts/fetch_olist_db.py"
+    # --host 0.0.0.0: Render's proxy connects over the network, not
+    #   loopback, so binding only to 127.0.0.1 would be unreachable.
+    # --port ${PORT:-10000}: Render's documented default web-service port
+    #   is 10000; reading $PORT (with that same fallback) works whether or
+    #   not you ever set a PORT env var yourself.
+    # --forwarded-allow-ips 127.0.0.1: see the long comment under
+    #   TRUST_PROXY_HEADERS below — this is NOT optional. Render sets
+    #   FORWARDED_ALLOW_IPS=* automatically for every Python service, and
+    #   uvicorn's OWN --proxy-headers feature (on by default) would
+    #   otherwise trust and rewrite request.client.host from the FIRST,
+    #   client-spoofable entry of X-Forwarded-For. This flag on the
+    #   command line overrides that env var and restores the safe,
+    #   loopback-only default — independent of and in addition to this
+    #   app's own TRUST_PROXY_HEADERS setting below.
+    startCommand: "uvicorn backend.main:app --host 0.0.0.0 --port ${PORT:-10000} --proxy-headers --forwarded-allow-ips 127.0.0.1"
+    healthCheckPath: /health
+    envVars:
+      # --- LLM provider ---
+      - key: SQLGENIE_LLM_MODE
+        value: gemini
+      - key: GEMINI_API_KEY
+        sync: false  # secret — paste your real key directly into the Render dashboard, never here
+      - key: GEMINI_MODEL
+        value: gemini-3.6-flash
+      - key: GEMINI_EMBED_MODEL
+        value: gemini-embedding-001
+
+      # --- CORS: the deployed Vercel frontend's exact origin(s) ---
+      - key: CORS_ALLOWED_ORIGINS
+        sync: false  # e.g. https://your-app.vercel.app — not known until the frontend is deployed; never "*"
+
+      # --- Reverse-proxy trust (see the startCommand comment above) ---
+      # true is what makes this app's OWN rate-limiting key on the real
+      # visitor instead of Render's shared proxy address — see
+      # backend/rate_limit.py's get_client_ip() docstring and the README's
+      # "Verifying the resolved client IP" section before relying on this.
+      - key: TRUST_PROXY_HEADERS
+        value: "true"
+
+      # --- Debug endpoint: stays off. Do not flip this on a public deploy. ---
+      - key: ENABLE_DEBUG_ENDPOINTS
+        value: "false"
+
+      # --- Olist database delivery (see scripts/fetch_olist_db.py) ---
+      - key: OLIST_DB_URL
+        sync: false  # the olist.db GitHub Release asset's direct download URL — not known until you've created the Release
+
+      # --- Paths (defaults shown explicitly for clarity; both already
+      #     match backend/config.py's own defaults) ---
+      - key: DATABASE_PATH
+        value: database/olist.db
+      - key: UPLOADS_DIR
+        value: uploads  # EPHEMERAL on Render's free tier — see the README
+
+      # --- Public API protection (defaults shown explicitly; tune in the
+      #     dashboard without touching code if real traffic needs it) ---
+      - key: MAX_QUESTION_LENGTH
+        value: "500"
+      - key: RATE_LIMIT_ASK_PER_MINUTE
+        value: "20"
+      - key: RATE_LIMIT_UPLOAD_PER_MINUTE
+        value: "5"
+      - key: RATE_LIMIT_SELECT_PER_MINUTE
+        value: "10"
+      - key: RATE_LIMIT_DEBUG_PER_MINUTE
+        value: "10"
+      - key: MAX_ROWS
+        value: "200"
+      - key: QUERY_TIMEOUT_SECONDS
+        value: "10"
