@@ -4,6 +4,7 @@ pandas>=2.0
 fastapi>=0.110
 uvicorn[standard]>=0.29
 openai>=1.30
+google-genai>=1.0,<4.0
 python-dotenv>=1.0
 sqlparse>=0.5
 

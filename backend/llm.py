@@ -22,6 +22,9 @@ import re
 import urllib.error
 import urllib.request
 
+from google import genai
+from google.genai import errors as genai_errors
+from google.genai import types as genai_types
 from openai import OpenAI
 
 from backend.config import settings
@@ -79,13 +82,13 @@ def _clean_sql_response(raw_text: str) -> str:
 def _unknown_mode_error() -> RuntimeError:
     return RuntimeError(
         f"Unknown SQLGENIE_LLM_MODE '{settings.SQLGENIE_LLM_MODE}'. "
-        "Expected 'mock', 'openai' or 'ollama' in .env."
+        "Expected 'mock', 'openai', 'ollama' or 'gemini' in .env."
     )
 
 
 def generate_sql(question: str, schema_text: str) -> str:
     """Turn `question` into one SQL query. This is the only function the
-    rest of the app calls — it decides mock vs. OpenAI vs. Ollama
+    rest of the app calls — it decides mock vs. OpenAI vs. Ollama vs. Gemini
     internally, based on settings.SQLGENIE_LLM_MODE, so callers never need
     to care which one actually runs.
 
@@ -100,6 +103,8 @@ def generate_sql(question: str, schema_text: str) -> str:
         return _generate_sql_openai(question, schema_text)
     if mode == "ollama":
         return _generate_sql_ollama(question, schema_text)
+    if mode == "gemini":
+        return _generate_sql_gemini(question, schema_text)
     raise _unknown_mode_error()
 
 
@@ -126,6 +131,8 @@ def correct_sql(
         return _correct_sql_openai(question, schema_text, failed_sql, db_error)
     if mode == "ollama":
         return _correct_sql_ollama(question, schema_text, failed_sql, db_error)
+    if mode == "gemini":
+        return _correct_sql_gemini(question, schema_text, failed_sql, db_error)
     raise _unknown_mode_error()
 
 
@@ -250,26 +257,156 @@ def _generate_sql_ollama(question: str, schema_text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Gemini (Google's cloud API). Uses the official `google-genai` SDK rather
+# than a raw HTTP call, since the SDK already handles auth headers, request
+# retries (429/5xx with backoff) and response parsing for us — the pieces
+# _call_ollama above has to do by hand with urllib.
+#
+# No client caching: a fresh genai.Client is built per call, exactly like
+# _call_openai builds a fresh OpenAI client per call above. These are cheap,
+# stateless objects — no connection is opened until a method is actually
+# called — and not caching one means a test can freely monkeypatch
+# settings.GEMINI_API_KEY between calls without a stale cached client.
+# ---------------------------------------------------------------------------
+
+# Gemini is a cloud API, not a local model with a cold-start load time like
+# Ollama's, so a shorter budget than _OLLAMA_TIMEOUT_SECONDS is appropriate.
+_GEMINI_TIMEOUT_SECONDS = 30
+# Retry only transient SERVER-side failures (5xx) — never 429. A 429 means
+# the account's quota/rate limit is already exhausted, and a short
+# exponential backoff (~1-4s) essentially never outlasts that; retrying
+# anyway just spends 2 more requests against an already-exhausted budget
+# for no real chance of success. A 429 instead fails immediately with one
+# clear "rate limit/quota" error (see _gemini_error_message below). A
+# 400/401/403 is never retried either — retrying a bad API key or a
+# malformed request would just waste attempts on a request that can't
+# succeed no matter how many times it's sent.
+_GEMINI_RETRY_STATUS_CODES = [500, 502, 503, 504]
+
+
+def _require_gemini_api_key() -> str:
+    if not settings.GEMINI_API_KEY:
+        raise RuntimeError(
+            "GEMINI_API_KEY is not set. Copy .env.example to .env and add your key."
+        )
+    return settings.GEMINI_API_KEY
+
+
+def _gemini_client() -> genai.Client:
+    return genai.Client(
+        api_key=_require_gemini_api_key(),
+        http_options=genai_types.HttpOptions(
+            timeout=_GEMINI_TIMEOUT_SECONDS * 1000,  # HttpOptions.timeout is milliseconds
+            retry_options=genai_types.HttpRetryOptions(
+                attempts=3, http_status_codes=_GEMINI_RETRY_STATUS_CODES,
+            ),
+        ),
+    )
+
+
+def _gemini_error_message(exc: genai_errors.APIError, model: str) -> str:
+    """One readable line from a Gemini APIError (ClientError/ServerError),
+    calling out a 429 (rate limit/quota) specifically since that's the
+    failure an operator on a free API tier is most likely to hit."""
+    if exc.code == 429:
+        return (
+            f"Gemini API rate limit or quota exceeded for model '{model}' "
+            f"(429): {exc.message}"
+        )
+    return f"Gemini API error for model '{model}' ({exc.code}): {exc.message}"
+
+
+def _call_gemini(system_content: str, user_content: str) -> str:
+    """Shared by _generate_sql_gemini and _correct_sql_gemini: send one
+    system instruction + one user message, return the cleaned SQL text.
+    Same system/user shape as _call_openai and _call_ollama above."""
+    model = settings.GEMINI_MODEL
+    client = _gemini_client()
+
+    try:
+        response = client.models.generate_content(
+            model=model,
+            contents=user_content,
+            config=genai_types.GenerateContentConfig(
+                system_instruction=system_content,
+                temperature=0,  # deterministic-ish output; we want SQL, not creativity
+            ),
+        )
+    except genai_errors.APIError as exc:
+        raise RuntimeError(_gemini_error_message(exc, model)) from exc
+    except Exception as exc:
+        # Covers connection/timeout failures from the SDK's underlying HTTP
+        # client — not a Gemini-side error, so there's no exc.code/message.
+        raise RuntimeError(f"Could not reach the Gemini API: {exc}") from exc
+
+    raw_text = response.text
+    if not raw_text:
+        raise RuntimeError(
+            f"Unexpected response from Gemini (model '{model}'): no text in the response."
+        )
+    return _clean_sql_response(raw_text)
+
+
+def _generate_sql_gemini(question: str, schema_text: str) -> str:
+    """The real Gemini call. Only used when SQLGENIE_LLM_MODE=gemini."""
+    return _call_gemini(SYSTEM_PROMPT_TEMPLATE.format(schema=schema_text), question)
+
+
+def _correct_sql_gemini(question: str, schema_text: str, failed_sql: str, db_error: str) -> str:
+    """The real Gemini correction call. Only used when SQLGENIE_LLM_MODE=gemini."""
+    user_content = CORRECTION_USER_TEMPLATE.format(
+        question=question, failed_sql=failed_sql, db_error=db_error
+    )
+    return _call_gemini(SYSTEM_PROMPT_TEMPLATE.format(schema=schema_text), user_content)
+
+
+def _embed_text_gemini(text: str) -> list[float]:
+    """GEMINI_EMBED_MODEL's embedding vector for `text`, via the Gemini API.
+    Only called by embed_text() below when SQLGENIE_LLM_MODE=gemini."""
+    model = settings.GEMINI_EMBED_MODEL
+    client = _gemini_client()
+
+    try:
+        response = client.models.embed_content(model=model, contents=text)
+    except genai_errors.APIError as exc:
+        raise RuntimeError(_gemini_error_message(exc, model)) from exc
+    except Exception as exc:
+        raise RuntimeError(f"Could not reach the Gemini API for embeddings: {exc}") from exc
+
+    embeddings = response.embeddings
+    values = embeddings[0].values if embeddings else None
+    if not values:
+        raise RuntimeError(
+            f"Unexpected response from Gemini embeddings (model '{model}'): "
+            "no embedding values in the response."
+        )
+    return values
+
+
+# ---------------------------------------------------------------------------
 # Embeddings, for backend/schema_retrieval.py's embedding-based retrieval.
 #
-# Unlike generate_sql()/correct_sql() above, this has no mock/openai/ollama
-# dispatch: retrieval always embeds locally via Ollama's OLLAMA_EMBED_MODEL,
-# regardless of SQLGENIE_LLM_MODE — even when that setting is "openai" (SQL
-# generation uses the cloud, retrieval still doesn't) or "mock" (tests fake
-# this call out; see tests/conftest.py).
+# mock/openai/ollama modes all embed locally via Ollama's OLLAMA_EMBED_MODEL,
+# regardless of SQLGENIE_LLM_MODE — even "openai" mode (SQL generation uses
+# the cloud, retrieval still doesn't) or "mock" (tests fake this call out;
+# see tests/conftest.py). "gemini" is the one exception: it embeds via the
+# Gemini API too (GEMINI_EMBED_MODEL), so a fully cloud-only deployment never
+# needs Ollama running at all.
 # ---------------------------------------------------------------------------
 
 _OLLAMA_EMBEDDINGS_PATH = "/api/embeddings"
 
 
 def embed_text(text: str) -> list[float]:
-    """Return OLLAMA_EMBED_MODEL's embedding vector for `text`, via Ollama's
-    local /api/embeddings endpoint. Raises RuntimeError with a readable
-    message on any failure (Ollama not running, model not pulled, a bad
-    response) — same error-handling shape as _call_ollama above, just
-    against a different endpoint and response shape (`{"embedding": [...]}`
-    instead of `{"message": {"content": ...}}`).
+    """Return the active embedding model's vector for `text` — Gemini's API
+    when SQLGENIE_LLM_MODE=gemini, otherwise Ollama's local /api/embeddings
+    endpoint (OLLAMA_EMBED_MODEL). Raises RuntimeError with a readable
+    message on any failure (not running/not pulled/missing key/a bad
+    response).
     """
+    if settings.SQLGENIE_LLM_MODE == "gemini":
+        return _embed_text_gemini(text)
+
     url = f"{settings.OLLAMA_BASE_URL}{_OLLAMA_EMBEDDINGS_PATH}"
     payload = {"model": settings.OLLAMA_EMBED_MODEL, "prompt": text}
     request = urllib.request.Request(

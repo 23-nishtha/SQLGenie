@@ -17,10 +17,11 @@ and maps the outcome to HTTP):
 Run it with:  uvicorn backend.main:app --reload
 Then open:    http://127.0.0.1:8000/docs
 """
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.middleware.body_limit import RequestBodyLimitMiddleware
 
 from backend import agent, csv_upload, dataset, schema_retrieval
 from backend.config import settings
@@ -28,6 +29,10 @@ from backend.dataset import DatasetListResponse, DatasetProfile, DatasetSummary
 from backend.models import (
     AskRequest, AskResponse, ErrorInfo, ErrorResponse, ErrorType, LlmInfo,
     Trace, TraceSummary,
+)
+from backend.rate_limit import (
+    enforce_ask_rate_limit, enforce_debug_rate_limit, enforce_select_rate_limit,
+    enforce_upload_rate_limit,
 )
 from backend.trace import redact_secrets
 
@@ -46,6 +51,18 @@ app = FastAPI(
 #     nothing to protect with credentials, and leaving it off is the safe
 #     choice (browsers refuse "*" combined with credentials anyway).
 #   allow_methods: only what the API actually offers.
+# A hard ceiling on any single request body (see settings.MAX_REQUEST_BODY_BYTES'
+# docstring in backend/config.py). Registered BEFORE CORSMiddleware below —
+# Starlette's add_middleware() PREPENDS, so the middleware added LAST ends
+# up OUTERMOST (closest to the client). Registering this one first means
+# CORSMiddleware ends up wrapping it, and CORSMiddleware adds its header to
+# every response that passes back through it regardless of which inner
+# layer produced it — so a request this middleware rejects with 413 still
+# comes back with a proper CORS header instead of a bare response the
+# browser can't read cross-origin. (See tests/test_input_limits.py's
+# wiring-order test, which would catch this being swapped back.)
+app.add_middleware(RequestBodyLimitMiddleware, max_body_size=settings.MAX_REQUEST_BODY_BYTES)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ALLOWED_ORIGINS,
@@ -65,6 +82,23 @@ def load_schema_on_startup() -> None:
     dataset.get_active_dataset()
 
 
+# Which settings attribute names the model for each non-mock mode. Shared by
+# /health and _llm_info() below so both report the SAME model for a given
+# mode — they used to disagree (every non-mock, non-ollama mode fell through
+# to OPENAI_MODEL, which was wrong for "ollama" and would have been wrong
+# for "gemini" too).
+_MODE_MODEL_ATTR: dict[str, str] = {
+    "openai": "OPENAI_MODEL",
+    "ollama": "OLLAMA_MODEL",
+    "gemini": "GEMINI_MODEL",
+}
+
+
+def _model_for_mode(mode: str) -> str | None:
+    attr = _MODE_MODEL_ATTR.get(mode)
+    return getattr(settings, attr) if attr else None
+
+
 @app.get("/health")
 def health_check():
     """Quick check that the API is up and the database file is reachable."""
@@ -73,15 +107,7 @@ def health_check():
         "database_path": str(settings.DATABASE_PATH),
         "database_found": settings.DATABASE_PATH.exists(),
         "llm_mode": settings.SQLGENIE_LLM_MODE,
-        "model": (
-            None
-            if settings.SQLGENIE_LLM_MODE == "mock"
-            else (
-                settings.OLLAMA_MODEL
-                if settings.SQLGENIE_LLM_MODE == "ollama"
-                else settings.OPENAI_MODEL
-            )
-        ),
+        "model": _model_for_mode(settings.SQLGENIE_LLM_MODE),
     }
 
 
@@ -106,7 +132,9 @@ def list_datasets() -> DatasetListResponse:
 
 
 @app.post("/datasets/{dataset_id}/select", response_model=DatasetSummary)
-def select_dataset(dataset_id: str) -> DatasetSummary:
+def select_dataset(
+    dataset_id: str, _rate_limit: None = Depends(enforce_select_rate_limit)
+) -> DatasetSummary:
     """Make `dataset_id` the active dataset — every /ask call afterward
     queries it. 404s with a clear message if the id isn't registered."""
     try:
@@ -116,13 +144,18 @@ def select_dataset(dataset_id: str) -> DatasetSummary:
     # Pre-warm the retrieval cache for the newly active dataset, same as
     # what happens for the default dataset at startup — otherwise the
     # FIRST /ask after switching would pay for a schema read that every
-    # later one wouldn't.
+    # later one wouldn't. A dataset already warmed earlier in this
+    # process (e.g. switching back to one visited before) is a no-op here
+    # — see init_documents()'s docstring — so repeatedly switching between
+    # a small set of datasets doesn't repeatedly re-embed any of them.
     schema_retrieval.init_documents()
     return profile.summary()
 
 
 @app.post("/datasets/upload", response_model=DatasetProfile)
-def upload_dataset(file: UploadFile = File(...)) -> DatasetProfile:
+def upload_dataset(
+    file: UploadFile = File(...), _rate_limit: None = Depends(enforce_upload_rate_limit)
+) -> DatasetProfile:
     """Upload one CSV, convert it to a single-table SQLite database (see
     backend/csv_upload.py for the validation/sanitization this goes
     through), register it, and make it the active dataset immediately —
@@ -159,15 +192,33 @@ def upload_dataset(file: UploadFile = File(...)) -> DatasetProfile:
     return profile
 
 
+def _enforce_debug_endpoint_enabled() -> None:
+    """Gates every /debug/* endpoint behind settings.ENABLE_DEBUG_ENDPOINTS
+    (false by default — see backend/config.py). 404, not 403: a disabled
+    debug endpoint should look like it doesn't exist at all, not confirm
+    there's a feature here that's merely forbidden."""
+    if not settings.ENABLE_DEBUG_ENDPOINTS:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
 @app.get("/debug/retrieve")
-def debug_retrieve(question: str):
-    """DEVELOPMENT/DEBUGGING ENDPOINT — not part of the normal user flow.
+def debug_retrieve(
+    question: str = Query(..., min_length=1, max_length=settings.MAX_QUESTION_LENGTH),
+    _enabled: None = Depends(_enforce_debug_endpoint_enabled),
+    _rate_limit: None = Depends(enforce_debug_rate_limit),
+):
+    """DEVELOPMENT/DEBUGGING ENDPOINT — not part of the normal user flow,
+    and NOT reachable at all unless ENABLE_DEBUG_ENDPOINTS=true (false by
+    default in every environment, including a public deployment — this
+    calls backend/llm.embed_text() once per request for the question's
+    embedding, same as /ask does, which is a real Gemini API call in
+    "gemini" mode).
 
     Shows exactly what backend/schema_retrieval.py would send the LLM for a
-    given question, WITHOUT calling OpenAI (no network call, no API key
-    needed, works in either SQLGENIE_LLM_MODE). Handy for seeing/tuning
-    which tables get retrieved for a question while building or debugging
-    Day 3's retrieval logic.
+    given question, WITHOUT calling the SQL-generation model itself. Handy
+    for seeing/tuning which tables get retrieved for a question while
+    building or debugging retrieval logic — enable it locally with
+    ENABLE_DEBUG_ENDPOINTS=true in .env.
 
     Try it at: /debug/retrieve?question=What is the average review score?
     """
@@ -196,7 +247,7 @@ _ERROR_STATUS: dict[ErrorType, int] = {
 
 def _llm_info() -> LlmInfo:
     mode = settings.SQLGENIE_LLM_MODE
-    return LlmInfo(mode=mode, model=None if mode == "mock" else settings.OPENAI_MODEL)
+    return LlmInfo(mode=mode, model=_model_for_mode(mode))
 
 
 def _empty_trace(dataset_summary: DatasetSummary) -> Trace:
@@ -274,7 +325,7 @@ def _error_message(run: agent.PipelineRun) -> str:
         502: {"model": ErrorResponse, "description": "The LLM call failed (missing key, network, quota...)."},
     },
 )
-def ask(request: AskRequest):
+def ask(request: AskRequest, _rate_limit: None = Depends(enforce_ask_rate_limit)):
     # backend/agent.py runs the whole pipeline: retrieval -> generate SQL ->
     # validate -> execute, and on a database error, asks the LLM to correct
     # the SQL and tries again (up to agent.MAX_CORRECTION_ATTEMPTS times).

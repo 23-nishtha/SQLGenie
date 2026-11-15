@@ -188,7 +188,14 @@ def test_table_embeddings_are_not_recomputed_per_question(monkeypatch):
     assert call_count["n"] == after_warmup + 2
 
 
-def test_init_documents_clears_and_rewarms_the_embedding_cache(monkeypatch):
+def test_init_documents_does_not_recompute_an_already_warm_dataset(monkeypatch):
+    """Stage 2.1: init_documents() used to unconditionally clear and
+    rebuild a dataset's embeddings on every call, which meant switching
+    back to a dataset already warmed earlier in the process re-embedded
+    every one of its tables again for nothing -- a real cost once
+    embeddings can be a billed Gemini call, and the reason
+    POST /datasets/{id}/select needed its own rate limit. Calling
+    init_documents() again for the SAME dataset must now be a no-op."""
     call_count = {"n": 0}
     real_embed_text = llm.embed_text
 
@@ -200,8 +207,65 @@ def test_init_documents_clears_and_rewarms_the_embedding_cache(monkeypatch):
 
     schema_retrieval.init_documents("olist")
     first_warmup_calls = call_count["n"]
+    assert first_warmup_calls > 1  # one call per Olist table
+
     schema_retrieval.init_documents("olist")  # re-warm, e.g. after a dataset switch back
+
+    assert call_count["n"] == first_warmup_calls  # no NEW embedding calls
+
+
+def test_init_documents_force_true_does_rebuild_an_already_warm_dataset(monkeypatch):
+    """The escape hatch for the one legitimate case the old unconditional
+    clear was actually protecting against: a dataset's .db file rebuilt on
+    disk while the server keeps running. force=True still only touches the
+    ONE dataset named, never any other cached one."""
+    call_count = {"n": 0}
+    real_embed_text = llm.embed_text
+
+    def counting_embed_text(text):
+        call_count["n"] += 1
+        return real_embed_text(text)
+
+    monkeypatch.setattr(llm, "embed_text", counting_embed_text)
+
+    schema_retrieval.init_documents("olist")
+    first_warmup_calls = call_count["n"]
+
+    schema_retrieval.init_documents("olist", force=True)
+
     assert call_count["n"] == first_warmup_calls * 2
+
+
+def test_switching_away_and_back_reuses_the_original_datasets_cache(monkeypatch):
+    """The "preserve correct behavior when switching datasets" half of the
+    Stage 2.1 fix: A -> B -> A must answer from A's own (reused, not
+    recomputed) cache, not B's, and must not pay to re-embed A again."""
+    call_count = {"n": 0}
+    real_embed_text = llm.embed_text
+
+    def counting_embed_text(text):
+        call_count["n"] += 1
+        return real_embed_text(text)
+
+    monkeypatch.setattr(llm, "embed_text", counting_embed_text)
+
+    schema_retrieval.init_documents("olist")
+    after_olist = call_count["n"]
+
+    schema_retrieval.init_documents(
+        "football", dataset.PROJECT_ROOT / "database/football/football.db"
+    )
+    # football is single-table -> no embedding calls at all, confirmed below.
+    after_football = call_count["n"]
+    assert after_football == after_olist
+
+    schema_retrieval.init_documents("olist")  # switch back
+    assert call_count["n"] == after_football  # olist's cache was reused, not rebuilt
+
+    details = schema_retrieval.retrieve_with_details(
+        "How many orders are there?", dataset_id="olist"
+    )
+    assert any(t.name == "orders" for t in details.tables)
 
 
 # ---------------------------------------------------------------------------

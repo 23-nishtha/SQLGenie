@@ -142,20 +142,44 @@ def _load_documents(dataset_id: str | None = None, db_path=None) -> dict[str, Sc
     return documents
 
 
-def init_documents(dataset_id: str | None = None, db_path=None) -> None:
+def init_documents(dataset_id: str | None = None, db_path=None, *, force: bool = False) -> None:
     """Warm the cache for one dataset (the active one by default) — called
     at startup and after selecting/uploading a dataset (see backend/main.py)
     — so a request only pays for one embedding call (the question's), not a
-    fresh SQLite read AND an embedding call per table. Clears everything
-    cached first: cheap, and correct if a dataset's underlying .db file was
-    ever rebuilt out from under a running server.
+    fresh SQLite read AND an embedding call per table.
+
+    Idempotent per dataset by default: this only ever touches the ONE
+    cache entry named by (dataset_id, db_path), never any OTHER dataset's —
+    and _load_documents()/_full_schema_chars()/_load_embeddings() each
+    already no-op internally when that entry is already cached, so calling
+    this again for a dataset that's already warm costs nothing. That
+    matters once embeddings can be a billed cloud call
+    (SQLGENIE_LLM_MODE=gemini): this function used to unconditionally clear
+    and rebuild EVERY cached dataset's embeddings on every call — including
+    every unrelated POST /datasets/{id}/select — which, multiplied by
+    SELECT * FROM a public, unauthenticated endpoint with no rate limit
+    before this was added, turned "switch datasets" into an unbounded
+    source of Gemini API calls (re-embedding every table of a dataset that
+    was already warm, every single time). Switching A -> B -> A now re-uses
+    A's cache from before, instead of recomputing it.
+
+    Pass force=True to discard and rebuild THIS ONE dataset's cache
+    regardless of whether it's already warm — e.g. its underlying .db file
+    was rebuilt on disk while the server kept running. This still never
+    touches any OTHER dataset's cache.
     """
-    _documents_cache.clear()
-    _full_schema_chars_cache.clear()
-    _embeddings_cache.clear()
-    _load_documents(dataset_id, db_path)
-    _full_schema_chars(dataset_id, db_path)
-    _load_embeddings(dataset_id, db_path)
+    resolved_id = _resolve_dataset_id(dataset_id)
+    resolved_path = _resolve_db_path(db_path)
+    cache_key = (resolved_id, str(resolved_path))
+
+    if force:
+        _documents_cache.pop(cache_key, None)
+        _full_schema_chars_cache.pop(cache_key, None)
+        _embeddings_cache.pop(cache_key, None)
+
+    _load_documents(resolved_id, resolved_path)
+    _full_schema_chars(resolved_id, resolved_path)
+    _load_embeddings(resolved_id, resolved_path)
 
 
 def _full_schema_chars(dataset_id: str | None = None, db_path=None) -> int:

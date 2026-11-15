@@ -212,7 +212,11 @@ def test_run_pipeline_reports_expected_failures_instead_of_raising(question):
 # ---------------------------------------------------------------------------
 
 
-def test_schema_retrieval_step_reports_tables_and_reasons(client):
+def test_schema_retrieval_step_reports_tables_and_reasons(client, monkeypatch):
+    # /debug/retrieve is disabled unless explicitly enabled (Stage 2.1) —
+    # this test exercises it deliberately, as the dev-only tool it is.
+    monkeypatch.setattr(settings, "ENABLE_DEBUG_ENDPOINTS", True)
+
     question = "What is the average review score?"
     # Mock mode has no canned SQL for this question, so /ask would answer
     # 400 — but retrieval runs before generation, so the retrieval step is
@@ -350,6 +354,24 @@ def test_llm_error_text_is_redacted(client, monkeypatch):
     # The same scrubbing applies inside the trace and the error block.
     assert configured not in json.dumps(body)
     assert "sk-proj-AbCdEfGhIjKlMnOp" not in json.dumps(body)
+
+
+def test_gemini_style_key_in_an_llm_error_is_also_redacted(client, monkeypatch):
+    """Stage 2 addition: a Gemini (or any Google "AIza..."-shaped) key must
+    be scrubbed from an /ask error exactly like an OpenAI key already is
+    above -- same redact_secrets() path, different provider."""
+    configured = "AIzaSyConfiguredGeminiKeyForThisTestOnly"
+    monkeypatch.setattr(settings, "GEMINI_API_KEY", configured)
+
+    def leaky(question, schema_text):
+        raise RuntimeError(f"Gemini rejected key {configured} (also seen: AIzaSyLeakedUnconfiguredKey)")
+
+    monkeypatch.setattr(llm, "generate_sql", leaky)
+
+    body = ask(client, "anything").json()
+    assert configured not in json.dumps(body)
+    assert "AIzaSyLeakedUnconfiguredKey" not in json.dumps(body)
+    assert "[redacted]" in body["detail"]
 
 
 def test_answer_question_still_raises_the_original_exceptions(monkeypatch):

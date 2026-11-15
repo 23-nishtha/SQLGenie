@@ -15,11 +15,21 @@ from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, Field
 
+from backend.config import settings
 from backend.dataset import DatasetSummary
 
 
 class AskRequest(BaseModel):
-    question: str = Field(..., min_length=1, description="A natural-language question about the data.")
+    # max_length enforcement reuses FastAPI's existing RequestValidationError
+    # handling (see main.py's handle_request_validation_error) — a question
+    # over the limit gets the same consistent ErrorResponse envelope as any
+    # other malformed request, no new error path needed.
+    question: str = Field(
+        ...,
+        min_length=1,
+        max_length=settings.MAX_QUESTION_LENGTH,
+        description="A natural-language question about the data.",
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -30,6 +30,26 @@ os.environ.setdefault("CORS_ALLOWED_ORIGINS", "http://localhost:5173,http://127.
 
 
 @pytest.fixture(autouse=True)
+def _reset_rate_limits():
+    """backend/rate_limit.py's limiters are module-level singletons with
+    real state (per-IP hit timestamps) — without this, hits accumulate
+    across the WHOLE test session (every TestClient request looks like it
+    comes from the same IP, since there's no real network/proxy in tests),
+    and an unrelated test later in the run would start seeing 429s purely
+    from earlier tests' traffic. Same spirit as _reset_dataset_registry
+    below: snapshot-and-restore would also work, but clearing is simpler
+    and correct here since no test depends on a limiter's PRE-existing state.
+    """
+    from backend import rate_limit
+
+    yield
+    rate_limit.ask_limiter._hits.clear()
+    rate_limit.upload_limiter._hits.clear()
+    rate_limit.select_limiter._hits.clear()
+    rate_limit.debug_limiter._hits.clear()
+
+
+@pytest.fixture(autouse=True)
 def _reset_dataset_registry():
     """Day 7: the active dataset and the dataset registry are real, mutable,
     in-memory server state (backend/dataset.py) — a test that uploads a CSV

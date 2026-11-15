@@ -44,15 +44,20 @@ def elapsed_ms(started: float) -> float:
 # these messages are shown to the frontend. So anything that came from
 # outside our own code is scrubbed first.
 _API_KEY_LIKE = re.compile(r"sk-[A-Za-z0-9_\-]{8,}")
+# Google API keys (Gemini included) are consistently shaped "AIza..." —
+# catches a leaked GEMINI_API_KEY even if it differs from the configured one.
+_GOOGLE_API_KEY_LIKE = re.compile(r"AIza[A-Za-z0-9_\-]{10,}")
 
 
 def redact_secrets(text: str) -> str:
-    """Replace the configured API key, and anything shaped like an OpenAI
-    key ("sk-..."), with a placeholder."""
-    key = settings.OPENAI_API_KEY
-    if key and len(key) >= 8:
-        text = text.replace(key, "[redacted]")
-    return _API_KEY_LIKE.sub("[redacted]", text)
+    """Replace every configured API key, and anything shaped like an OpenAI
+    ("sk-...") or Google/Gemini ("AIza...") key, with a placeholder."""
+    for key in (settings.OPENAI_API_KEY, settings.GEMINI_API_KEY):
+        if key and len(key) >= 8:
+            text = text.replace(key, "[redacted]")
+    text = _API_KEY_LIKE.sub("[redacted]", text)
+    text = _GOOGLE_API_KEY_LIKE.sub("[redacted]", text)
+    return text
 
 
 class TraceRecorder:
